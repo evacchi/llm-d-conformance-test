@@ -30,6 +30,10 @@ var (
 	noCleanup     bool
 	mockImage      string // mock vLLM image for testing without GPU
 	pullSecretName string // override pull secret name to copy into namespace
+	// Benchmark / helmfile flags
+	helmfilePath string // path to helmfile template for benchmark scenarios
+	guidesPath   string // path to llm-d guides directory (exported as LLM_D_GUIDES)
+	helmfileEnv  string // helmfile environment (default: "default")
 )
 
 func init() {
@@ -50,6 +54,9 @@ func init() {
 	flag.BoolVar(&noCleanup, "nocleanup", false, "Skip cleanup after tests (leave resources running for debugging)")
 	flag.StringVar(&mockImage, "mock", "", "Mock vLLM image for testing without GPU (e.g., ghcr.io/aneeshkp/vllm-mock:latest)")
 	flag.StringVar(&pullSecretName, "pull-secret", "", "Pull secret name to copy into test namespace (default: auto-detect from manifest)")
+	flag.StringVar(&helmfilePath, "helmfile", "", "Path to helmfile template for benchmark scenarios (e.g., deploy/helmfiles/is-vanilla/helmfile.yaml.gotmpl)")
+	flag.StringVar(&guidesPath, "guides", "", "Path to llm-d guides directory (exported as LLM_D_GUIDES for helmfile)")
+	flag.StringVar(&helmfileEnv, "helmfile-env", "default", "Helmfile environment name")
 }
 
 // findRootDir walks up from the current working directory to find the project root (containing go.mod).

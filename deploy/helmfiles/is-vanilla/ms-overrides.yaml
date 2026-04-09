@@ -1,0 +1,13 @@
+# Override upstream guide values to fit CI cluster quota.
+# Upstream assumes a large cluster (8 decode replicas x TP=2 = 16 GPUs).
+# Our benchmark cluster has 8 GPU quota, so we run 3 x TP=1 = 3 GPUs.
+#
+# The upstream guide sets authSecretName to llm-d-hf-token, but our CI
+# benchmarks use public models (Qwen) that don't need it. Clear it so
+# vLLM pods start without the secret.
+modelArtifacts:
+  authSecretName: ""
+decode:
+  replicas: 3
+  parallelism:
+    tensor: 1

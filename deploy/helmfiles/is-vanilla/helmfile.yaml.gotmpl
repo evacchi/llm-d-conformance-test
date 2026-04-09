@@ -1,0 +1,76 @@
+{{/*
+  Inference-scheduling helmfile for vanilla (default EPP plugins).
+
+  Wraps the upstream llm-d inference-scheduling guide with CI-sized
+  resource overrides but no EPP plugin changes, so the default
+  max-score-picker sticky routing behavior is preserved.
+
+  Set LLM_D_GUIDES to the absolute path of llm-d/guides/inference-scheduling/
+  e.g. export LLM_D_GUIDES=/home/user/git/llm-d/llm-d/guides/inference-scheduling
+*/}}
+
+environments:
+  default:
+    values:
+      - {{ requiredEnv "LLM_D_GUIDES" }}/../prereq/gateway-provider/common-configurations/istio.yaml
+
+---
+
+{{- $guides := requiredEnv "LLM_D_GUIDES" -}}
+{{- $ns := .Namespace | default "llm-d-inference-scheduling" -}}
+{{- $rn := (env "RELEASE_NAME_POSTFIX") | default "inference-scheduling" -}}
+
+repositories:
+  - name: llm-d-modelservice
+    url: https://llm-d-incubation.github.io/llm-d-modelservice/
+  - name: llm-d-infra
+    url: https://llm-d-incubation.github.io/llm-d-infra/
+
+releases:
+  - name: {{ printf "infra-%s" $rn | quote }}
+    namespace: {{ $ns }}
+    chart: llm-d-infra/llm-d-infra
+    version: v1.4.0
+    installed: true
+    labels:
+      type: infrastructure
+      kind: inference-stack
+    values:
+      - gateway:
+          {{ .Environment.Values.gateway | toYaml | nindent 10 }}
+
+  - name: {{ printf "gaie-%s" $rn | quote }}
+    namespace: {{ $ns }}
+    chart: oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool
+    version: v1.4.0
+    installed: true
+    needs:
+      - {{ printf "infra-%s" $rn | quote }}
+    values:
+      - {{ $guides }}/gaie-inference-scheduling/values.yaml
+      - provider:
+          name: {{ .Environment.Values.provider.name }}
+          istio:
+            {{ .Environment.Values.provider.istio | toYaml | nindent 12 }}
+      - provider:
+          istio:
+            destinationRule:
+              host: {{ printf "gaie-%s-epp.%s.svc.cluster.local" $rn $ns | quote }}
+    labels:
+      kind: inference-stack
+
+  - name: {{ printf "ms-%s" $rn | quote }}
+    namespace: {{ $ns }}
+    chart: llm-d-modelservice/llm-d-modelservice
+    version: v0.4.7
+    installed: true
+    needs:
+      - {{ printf "infra-%s" $rn | quote }}
+      - {{ printf "gaie-%s" $rn | quote }}
+    values:
+      - {{ $guides }}/ms-inference-scheduling/values.yaml
+      - ms-overrides.yaml
+      - modelArtifacts:
+          name: {{ env "MODEL" | default "Qwen/Qwen2.5-7B-Instruct" | quote }}
+    labels:
+      kind: inference-stack
