@@ -58,6 +58,7 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		eppPods        []string
 		useAppWrapper  bool
 		streamer       *deployer.Streamer
+		portForward    *deployer.PortForwardResult
 	)
 
 	BeforeAll(func() {
@@ -269,9 +270,16 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		if endpoint != "" {
 			svcEndpoint = endpoint
 		} else {
-			var err error
-			svcEndpoint, err = dep.FindServiceEndpoint(ctx, benchNamespace)
-			Expect(err).NotTo(HaveOccurred(), "could not find service endpoint")
+			// Port-forward to the gateway service so we can reach it from outside the cluster
+			svcName, svcPort, err := dep.FindGatewayService(ctx, benchNamespace)
+			Expect(err).NotTo(HaveOccurred(), "could not find gateway service")
+			logStep("[benchmark] Found gateway service: %s:%d", svcName, svcPort)
+
+			pf, err := dep.StartPortForward(ctx, benchNamespace, svcName, svcPort)
+			Expect(err).NotTo(HaveOccurred(), "could not start port-forward")
+			portForward = pf
+			svcEndpoint = pf.URL
+			logStep("[benchmark] Port-forward started: %s -> svc/%s:%d", svcEndpoint, svcName, svcPort)
 		}
 		logStep("[benchmark] Service endpoint: %s", svcEndpoint)
 		llmClient = client.New(svcEndpoint)
@@ -405,6 +413,11 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 	// ── CLEANUP ──────────────────────────────────────────────────
 	AfterAll(func() {
+		// Stop port-forward
+		if portForward != nil {
+			portForward.Stop()
+		}
+
 		// Stop background streams
 		if streamer != nil {
 			streamer.Stop()
