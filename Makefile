@@ -203,8 +203,13 @@ test-profile-moe: # MoE (8 GPUs + RDMA)
 HELMFILE ?=
 GUIDES ?=
 HELMFILE_ENV ?= default
+JUNIT_REPORT ?=
 
 BENCHMARK_FLAGS = --ginkgo.label-filter=benchmark
+
+ifdef JUNIT_REPORT
+  GINKGO_FLAGS += --ginkgo.junit-report=$(JUNIT_REPORT)
+endif
 
 ifdef HELMFILE
   BENCHMARK_FLAGS += -helmfile=$(HELMFILE)
