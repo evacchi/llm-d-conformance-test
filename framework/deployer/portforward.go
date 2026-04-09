@@ -77,7 +77,8 @@ func (d *Deployer) StartPortForward(ctx context.Context, namespace, svcName stri
 	}
 
 	cmd := exec.CommandContext(pfCtx, "kubectl", args...)
-	cmd.Stderr = nil // discard exec-plugin noise
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -85,8 +86,13 @@ func (d *Deployer) StartPortForward(ctx context.Context, namespace, svcName stri
 	}
 
 	// Wait for the port to accept connections
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
+		// Check if the process has exited (e.g. kubectl errored out)
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			cancel()
+			return nil, fmt.Errorf("port-forward process exited: %s", stderrBuf.String())
+		}
 		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 500*time.Millisecond)
 		if dialErr == nil {
 			_ = conn.Close()
@@ -101,10 +107,11 @@ func (d *Deployer) StartPortForward(ctx context.Context, namespace, svcName stri
 	}
 
 	// Cleanup on timeout
+	stderrOut := stderrBuf.String()
 	cancel()
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
-	return nil, fmt.Errorf("port-forward to svc/%s did not become ready within 15s", svcName)
+	return nil, fmt.Errorf("port-forward to svc/%s did not become ready within 30s\nstderr: %s", svcName, stderrOut)
 }
 
 func freePort() (int, error) {

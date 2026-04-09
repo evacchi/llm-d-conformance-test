@@ -208,7 +208,7 @@ JUNIT_REPORT ?=
 BENCHMARK_FLAGS = --ginkgo.label-filter=benchmark
 
 ifdef JUNIT_REPORT
-  GINKGO_FLAGS += --ginkgo.junit-report=$(JUNIT_REPORT)
+  GINKGO_FLAGS += --ginkgo.junit-report=$(abspath $(JUNIT_REPORT))
 endif
 
 ifdef HELMFILE
