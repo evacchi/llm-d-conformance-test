@@ -46,19 +46,23 @@ func helmfileExtraEnv(hfPath, model string) map[string]string {
 	return env
 }
 
-const appWrapperName = "llmd-benchmark"
+const (
+	appWrapperName   = "llmd-benchmark"
+	smokeTestJobName = "llmd-smoketest"
+)
 
 var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 	var (
-		benchNamespace string
-		svcEndpoint    string
-		llmClient      *client.LLMClient
-		modelName      string
-		vllmPods       []string
-		eppPods        []string
-		useAppWrapper  bool
-		streamer       *deployer.Streamer
-		portForward    *deployer.PortForwardResult
+		benchNamespace  string
+		svcEndpoint     string
+		llmClient       *client.LLMClient
+		modelName       string
+		vllmPods        []string
+		eppPods         []string
+		useAppWrapper   bool
+		useSmokeTestJob bool
+		targetURL       string
+		streamer        *deployer.Streamer
 	)
 
 	BeforeAll(func() {
@@ -116,6 +120,22 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
 			streamer.StreamEvents(ctx, "[event]")
 			streamer.StreamAllPodLogs(ctx, 10*time.Second)
+
+			// Deploy in-cluster smoke-test Job (if no external endpoint provided)
+			if endpoint == "" {
+				var gwErr error
+				targetURL, gwErr = dep.FindGatewayTarget(ctx, benchNamespace)
+				Expect(gwErr).NotTo(HaveOccurred(), "could not derive target URL from Gateway")
+				logStep("[benchmark] Derived target URL: %s", targetURL)
+
+				job := deployer.BuildSmokeTestJob(deployer.SmokeTestConfig{
+					Name: smokeTestJobName, Namespace: benchNamespace,
+					Target: targetURL, Model: modelName,
+				})
+				Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying smoke-test Job")
+				useSmokeTestJob = true
+				logStep("[benchmark] Smoke-test Job applied")
+			}
 			return
 		}
 
@@ -135,6 +155,22 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		classified := deployer.ClassifyResources(resources)
 		logStep("[benchmark] Prerequisites: %s", deployer.ResourcesSummary(classified.Prerequisites))
 		logStep("[benchmark] Workloads:      %s", deployer.ResourcesSummary(classified.Workloads))
+
+		// If no external endpoint, derive target from Gateway and add smoke-test Job
+		if endpoint == "" {
+			allResources := append(classified.Prerequisites, classified.Workloads...)
+			targetURL = deployer.DeriveTargetFromGateway(allResources, benchNamespace)
+			Expect(targetURL).NotTo(BeEmpty(), "no Gateway found in rendered resources — cannot derive in-cluster target URL")
+			logStep("[benchmark] Derived target URL: %s", targetURL)
+
+			job := deployer.BuildSmokeTestJob(deployer.SmokeTestConfig{
+				Name: smokeTestJobName, Namespace: benchNamespace,
+				Target: targetURL, Model: modelName,
+			})
+			classified.Workloads = append(classified.Workloads, job)
+			useSmokeTestJob = true
+			logStep("[benchmark] Smoke-test Job added to AppWrapper workloads")
+		}
 
 		// Ensure namespace exists
 		_, _ = dep.Kubectl(ctx, "create", "namespace", benchNamespace, "--dry-run=client", "-o", "yaml")
@@ -265,74 +301,65 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 	})
 
-	// ── Phase 4: ENDPOINT DISCOVERY ──────────────────────────────
-	It("should discover inference service endpoint", func() {
-		if endpoint != "" {
-			svcEndpoint = endpoint
+	// ── Phase 4: VALIDATE SERVICE ────────────────────────────────
+	It("should validate inference service", func() {
+		if useSmokeTestJob {
+			// In-cluster smoke-test Job: wait for it to complete
+			logStep("[benchmark] Waiting for smoke-test Job %s to complete", smokeTestJobName)
+			err := dep.WaitForJobCompletion(ctx, smokeTestJobName, benchNamespace, 15*time.Minute)
+			Expect(err).NotTo(HaveOccurred(), "smoke test Job failed")
+
+			logs, _ := dep.GetJobLogs(ctx, smokeTestJobName, benchNamespace)
+			logStep("[benchmark] Smoke test output:\n%s", logs)
 		} else {
-			// Port-forward to the gateway service so we can reach it from outside the cluster
-			svcName, svcPort, err := dep.FindGatewayService(ctx, benchNamespace)
-			Expect(err).NotTo(HaveOccurred(), "could not find gateway service")
-			logStep("[benchmark] Found gateway service: %s:%d", svcName, svcPort)
+			// External endpoint validation
+			svcEndpoint = endpoint
+			logStep("[benchmark] Service endpoint: %s", svcEndpoint)
+			llmClient = client.New(svcEndpoint)
 
-			pf, err := dep.StartPortForward(ctx, benchNamespace, svcName, svcPort)
-			Expect(err).NotTo(HaveOccurred(), "could not start port-forward")
-			portForward = pf
-			svcEndpoint = pf.URL
-			logStep("[benchmark] Port-forward started: %s -> svc/%s:%d", svcEndpoint, svcName, svcPort)
-		}
-		logStep("[benchmark] Service endpoint: %s", svcEndpoint)
-		llmClient = client.New(svcEndpoint)
-	})
+			// Health check
+			logStep("[benchmark] Checking /health endpoint")
+			err := retry.UntilSuccess(ctx, retry.Options{
+				Timeout:  2 * time.Minute,
+				Interval: 5 * time.Second,
+				Name:     "health-check",
+			}, func() error {
+				return llmClient.HealthCheck(ctx)
+			})
+			Expect(err).NotTo(HaveOccurred(), "/health failed")
 
-	// ── Phase 5: HEALTH ──────────────────────────────────────────
-	It("should pass health check", func() {
-		logStep("[benchmark] Checking /health endpoint")
-		err := retry.UntilSuccess(ctx, retry.Options{
-			Timeout:  2 * time.Minute,
-			Interval: 5 * time.Second,
-			Name:     "health-check",
-		}, func() error {
-			return llmClient.HealthCheck(ctx)
-		})
-		Expect(err).NotTo(HaveOccurred(), "/health failed")
-	})
-
-	// ── Phase 6: MODEL LISTING ───────────────────────────────────
-	It("should list model in /v1/models", func() {
-		logStep("[benchmark] Checking /v1/models")
-		models, err := llmClient.ListModels(ctx)
-		Expect(err).NotTo(HaveOccurred(), "/v1/models failed")
-		Expect(models.Data).NotTo(BeEmpty(), "no models listed")
-
-		found := false
-		for _, m := range models.Data {
-			if m.ID == modelName {
-				found = true
-				break
+			// Model listing
+			logStep("[benchmark] Checking /v1/models")
+			models, err := llmClient.ListModels(ctx)
+			Expect(err).NotTo(HaveOccurred(), "/v1/models failed")
+			Expect(models.Data).NotTo(BeEmpty(), "no models listed")
+			found := false
+			for _, m := range models.Data {
+				if m.ID == modelName {
+					found = true
+					break
+				}
 			}
-		}
-		if !found && len(models.Data) > 0 {
-			logStep("[benchmark] Model %s not found, using %s", modelName, models.Data[0].ID)
-			modelName = models.Data[0].ID
-		}
-		logStep("[benchmark] Model available: %s", modelName)
-	})
+			if !found && len(models.Data) > 0 {
+				logStep("[benchmark] Model %s not found, using %s", modelName, models.Data[0].ID)
+				modelName = models.Data[0].ID
+			}
+			logStep("[benchmark] Model available: %s", modelName)
 
-	// ── Phase 7: INFERENCE ───────────────────────────────────────
-	It("should return inference response", func() {
-		logStep("[benchmark] Running inference test")
-		resp, err := llmClient.ChatCompletions(ctx, client.ChatRequest{
-			Model: modelName,
-			Messages: []client.ChatMessage{
-				{Role: "user", Content: "What is 2+2? Answer in one word."},
-			},
-			MaxTokens: 20,
-		})
-		Expect(err).NotTo(HaveOccurred(), "chat completion failed")
-		Expect(resp.Choices).NotTo(BeEmpty(), "no choices returned")
-		Expect(resp.Choices[0].Message.Content).NotTo(BeEmpty(), "empty response content")
-		logStep("[benchmark] Inference OK: %q (tokens=%d)", resp.Choices[0].Message.Content, resp.Usage.TotalTokens)
+			// Inference
+			logStep("[benchmark] Running inference test")
+			resp, err := llmClient.ChatCompletions(ctx, client.ChatRequest{
+				Model: modelName,
+				Messages: []client.ChatMessage{
+					{Role: "user", Content: "What is 2+2? Answer in one word."},
+				},
+				MaxTokens: 20,
+			})
+			Expect(err).NotTo(HaveOccurred(), "chat completion failed")
+			Expect(resp.Choices).NotTo(BeEmpty(), "no choices returned")
+			Expect(resp.Choices[0].Message.Content).NotTo(BeEmpty(), "empty response content")
+			logStep("[benchmark] Inference OK: %q (tokens=%d)", resp.Choices[0].Message.Content, resp.Usage.TotalTokens)
+		}
 	})
 
 	// ── Phase 8: vLLM METRICS ────────────────────────────────────
@@ -413,11 +440,6 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 	// ── CLEANUP ──────────────────────────────────────────────────
 	AfterAll(func() {
-		// Stop port-forward
-		if portForward != nil {
-			portForward.Stop()
-		}
-
 		// Stop background streams
 		if streamer != nil {
 			streamer.Stop()
@@ -432,6 +454,11 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		}
 
 		logStep("[benchmark] Cleaning up namespace %s", benchNamespace)
+
+		// Clean up standalone smoke-test Job (not needed for AppWrapper — Job is a component)
+		if useSmokeTestJob && !useAppWrapper {
+			_, _ = dep.Kubectl(ctx, "delete", "job", smokeTestJobName, "-n", benchNamespace, "--ignore-not-found=true")
+		}
 
 		if useAppWrapper {
 			// Delete AppWrapper first — it cascades to wrapped resources
