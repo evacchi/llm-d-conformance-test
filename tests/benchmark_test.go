@@ -111,9 +111,10 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			Expect(err).NotTo(HaveOccurred(), "helmfile sync failed")
 			logStep("[benchmark] Helmfile sync completed")
 
-			// Start streaming K8s events in the background
+			// Start streaming K8s events and pod logs in the background
 			streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
 			streamer.StreamEvents(ctx, "[event]")
+			streamer.StreamAllPodLogs(ctx, 10*time.Second)
 			return
 		}
 
@@ -153,9 +154,10 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		})).To(Succeed(), "applying AppWrapper")
 		logStep("[benchmark] AppWrapper applied")
 
-		// Start streaming K8s events in the background
+		// Start streaming K8s events and pod logs in the background
 		streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
 		streamer.StreamEvents(ctx, "[event]")
+		streamer.StreamAllPodLogs(ctx, 10*time.Second)
 	})
 
 	// ── Phase 2: WAIT FOR APPWRAPPER (if applicable) ─────────────
@@ -260,12 +262,6 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			logStep("[benchmark] Found %d EPP pod(s): %v", len(eppPods), eppPods)
 		}
 
-		// Stream pod logs in the background for visibility
-		if streamer != nil {
-			for _, pod := range eppPods {
-				streamer.StreamPodLogs(ctx, pod)
-			}
-		}
 	})
 
 	// ── Phase 4: ENDPOINT DISCOVERY ──────────────────────────────

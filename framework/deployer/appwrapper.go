@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -240,13 +241,19 @@ func (d *Deployer) applyYAML(ctx context.Context, yamlContent, namespace string)
 }
 
 // GetAppWrapperPhase returns the current phase of an AppWrapper (e.g. "Pending", "Resuming", "Running", "Failed").
+// Uses stdout-only capture to avoid exec-plugin auth noise from stderr.
 func (d *Deployer) GetAppWrapperPhase(ctx context.Context, name, namespace string) (string, error) {
-	out, err := d.Kubectl(ctx, "get", "appwrapper", name, "-n", namespace,
-		"-o", "jsonpath={.status.phase}")
+	args := []string{"get", "appwrapper", name, "-n", namespace,
+		"-o", "jsonpath={.status.phase}"}
+	if d.Kubeconfig != "" {
+		args = append([]string{"--kubeconfig", d.Kubeconfig}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	out, err := cmd.Output() // stdout only — avoids exec-plugin noise
 	if err != nil {
 		return "", fmt.Errorf("getting AppWrapper phase: %w", err)
 	}
-	phase := strings.TrimSpace(out)
+	phase := strings.TrimSpace(string(out))
 	if phase == "" {
 		return "Pending", nil
 	}
