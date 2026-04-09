@@ -174,10 +174,12 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			}
 			pods := strings.TrimSpace(out)
 			if pods == "" {
+				logStep("[benchmark]   no pods found yet in namespace %s", benchNamespace)
 				return fmt.Errorf("no pods found in namespace %s", benchNamespace)
 			}
 
 			allRunning := true
+			var pending []string
 			for _, line := range strings.Split(pods, "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
@@ -185,7 +187,9 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 				}
 
 				fields := make(map[string]string)
-				for _, part := range strings.Fields(line) {
+				parts := strings.Fields(line)
+				podName := parts[0]
+				for _, part := range parts {
 					if k, v, ok := strings.Cut(part, "="); ok {
 						fields[k] = v
 					}
@@ -193,16 +197,17 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 				reason := fields["reason"]
 				if reason == "CrashLoopBackOff" || reason == "Error" || reason == "CreateContainerError" || reason == "ErrImagePull" || reason == "ImagePullBackOff" {
-					podName := strings.Fields(line)[0]
 					logs, _ := dep.Kubectl(ctx, "logs", podName, "-n", benchNamespace, "--tail=10", "--all-containers=true")
 					Fail(fmt.Sprintf("Pod crash detected: %s\nLogs:\n%s", line, logs))
 				}
 
 				if fields["phase"] != "Running" || fields["ready"] != "true" {
 					allRunning = false
+					pending = append(pending, fmt.Sprintf("%s (phase=%s ready=%s)", podName, fields["phase"], fields["ready"]))
 				}
 			}
 			if !allRunning {
+				logStep("[benchmark]   waiting on %d pod(s): %s", len(pending), strings.Join(pending, ", "))
 				return fmt.Errorf("not all pods Running/Ready yet")
 			}
 			return nil
