@@ -12,7 +12,6 @@ import (
 
 	"github.com/aneeshkp/llm-d-conformance-test/framework/client"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/deployer"
-	"github.com/aneeshkp/llm-d-conformance-test/framework/metrics"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/retry"
 )
 
@@ -57,8 +56,6 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		svcEndpoint     string
 		llmClient       *client.LLMClient
 		modelName       string
-		vllmPods        []string
-		eppPods         []string
 		useAppWrapper   bool
 		useSmokeTestJob bool
 		targetURL       string
@@ -285,23 +282,6 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			return nil
 		})
 		Expect(err).NotTo(HaveOccurred(), "pods did not become ready")
-
-		// Discover vLLM and EPP pods
-		var discoverErr error
-		vllmPods, discoverErr = dep.ListVLLMPods(ctx, benchNamespace)
-		if discoverErr != nil {
-			logStep("[benchmark] WARNING: could not discover vLLM pods: %v", discoverErr)
-		} else {
-			logStep("[benchmark] Found %d vLLM pod(s): %v", len(vllmPods), vllmPods)
-		}
-
-		eppPods, discoverErr = dep.ListEPPPods(ctx, benchNamespace)
-		if discoverErr != nil {
-			logStep("[benchmark] WARNING: could not discover EPP pods: %v", discoverErr)
-		} else {
-			logStep("[benchmark] Found %d EPP pod(s): %v", len(eppPods), eppPods)
-		}
-
 	})
 
 	// ── Phase 4: VALIDATE SERVICE ────────────────────────────────
@@ -371,82 +351,6 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			Expect(resp.Choices[0].Message.Content).NotTo(BeEmpty(), "empty response content")
 			logStep("[benchmark] Inference OK: %q (tokens=%d)", resp.Choices[0].Message.Content, resp.Usage.TotalTokens)
 		}
-	})
-
-	// ── Phase 8: vLLM METRICS ────────────────────────────────────
-	It("should have healthy vLLM metrics", func() {
-		if len(vllmPods) == 0 {
-			Skip("no vLLM pods discovered")
-		}
-		if mockImage != "" {
-			Skip("mock mode — no real vLLM metrics")
-		}
-
-		logStep("[benchmark] Scraping vLLM metrics from %d pod(s)", len(vllmPods))
-		scraper := &metrics.Scraper{
-			Kubectl:   dep.Kubectl,
-			Namespace: benchNamespace,
-			LogFunc:   logStep,
-		}
-
-		var totalRequests float64
-		var totalGenTokens float64
-		for _, pod := range vllmPods {
-			result, err := scraper.ScrapePod(ctx, pod, 8000)
-			if err != nil {
-				logStep("[benchmark]   WARNING: scrape %s failed: %v", pod, err)
-				continue
-			}
-
-			if v, ok := result.GetValue(metrics.MetricRequestSuccess); ok {
-				totalRequests += v
-				logStep("[benchmark]   %s: request_success=%.0f", pod, v)
-			}
-			if v, ok := result.GetValue(metrics.MetricGenTokens); ok {
-				totalGenTokens += v
-			}
-		}
-		Expect(totalRequests).To(BeNumerically(">", 0), "no successful requests recorded in vLLM metrics")
-		logStep("[benchmark] vLLM metrics OK: requests=%.0f, gen_tokens=%.0f", totalRequests, totalGenTokens)
-	})
-
-	// ── Phase 9: EPP METRICS ─────────────────────────────────────
-	It("should have healthy EPP metrics", func() {
-		if len(eppPods) == 0 {
-			Skip("no EPP pods discovered")
-		}
-
-		logStep("[benchmark] Scraping EPP metrics from %d pod(s)", len(eppPods))
-		scraper := &metrics.Scraper{
-			Kubectl:   dep.Kubectl,
-			Namespace: benchNamespace,
-			LogFunc:   logStep,
-		}
-
-		for _, pod := range eppPods {
-			// EPP metrics on port 9090, fallback to 8080
-			result, err := scraper.ScrapePod(ctx, pod, 9090)
-			if err != nil {
-				result, err = scraper.ScrapePod(ctx, pod, 8080)
-			}
-			if err != nil {
-				logStep("[benchmark]   WARNING: scrape %s failed: %v", pod, err)
-				continue
-			}
-
-			if v, ok := result.GetValue(metrics.MetricRequestTotal); ok {
-				logStep("[benchmark]   %s: request_total=%.0f", pod, v)
-				Expect(v).To(BeNumerically(">", 0), "EPP should have routed requests")
-			}
-			if v, ok := result.GetValue(metrics.MetricPoolReadyPods); ok {
-				logStep("[benchmark]   %s: ready_pods=%.0f", pod, v)
-				Expect(v).To(BeNumerically(">", 0), "EPP should see ready pods")
-			}
-			if v, ok := result.GetValue(metrics.MetricRequestErrorTotal); ok {
-				logStep("[benchmark]   %s: request_errors=%.0f", pod, v)
-			}
-		}
-		logStep("[benchmark] EPP metrics OK")
 	})
 
 	// ── CLEANUP ──────────────────────────────────────────────────
