@@ -79,7 +79,7 @@ func ParseMultiDocYAML(yamlContent string) ([]*K8sResource, error) {
 	var resources []*K8sResource
 	decoder := yaml.NewDecoder(strings.NewReader(yamlContent))
 	for {
-		var raw map[string]interface{}
+		var raw interface{}
 		err := decoder.Decode(&raw)
 		if err != nil {
 			if err.Error() == "EOF" {
@@ -90,14 +90,19 @@ func ParseMultiDocYAML(yamlContent string) ([]*K8sResource, error) {
 		if raw == nil {
 			continue
 		}
-		r := &K8sResource{Raw: raw}
-		if v, ok := raw["apiVersion"].(string); ok {
+		// Skip non-map documents (e.g. helmfile log lines like "Adding repo...")
+		rawMap, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		r := &K8sResource{Raw: rawMap}
+		if v, ok := rawMap["apiVersion"].(string); ok {
 			r.APIVersion = v
 		}
-		if v, ok := raw["kind"].(string); ok {
+		if v, ok := rawMap["kind"].(string); ok {
 			r.Kind = v
 		}
-		if meta, ok := raw["metadata"].(map[string]interface{}); ok {
+		if meta, ok := rawMap["metadata"].(map[string]interface{}); ok {
 			if v, ok := meta["name"].(string); ok {
 				r.Name = v
 			}

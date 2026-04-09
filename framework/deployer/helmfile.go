@@ -32,6 +32,7 @@ func (d *Deployer) HelmfileTemplate(ctx context.Context, helmfilePath, environme
 		"--file", helmfilePath,
 		"--environment", environment,
 		"-n", namespace,
+		"--quiet",
 		"template",
 	}
 	output, err := d.runHelmfile(ctx, args, extraEnv)
