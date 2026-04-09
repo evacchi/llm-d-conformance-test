@@ -555,7 +555,7 @@ func (d *Deployer) Kubectl(ctx context.Context, args ...string) (string, error) 
 
 func (d *Deployer) runCommand(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
+	output, err := cmd.Output() // stdout only — avoids exec-plugin/OIDC noise from stderr
 	return string(output), err
 }
 
