@@ -198,6 +198,31 @@ test-profile-pd: # P/D disaggregation
 test-profile-moe: # MoE (8 GPUs + RDMA)
 	$(MAKE) test-conformance PROFILE=configs/profiles/deepseek.yaml
 
+# ─── Benchmark (helmfile-based) ──────────────────────────────────
+
+HELMFILE ?=
+GUIDES ?=
+HELMFILE_ENV ?= default
+
+BENCHMARK_FLAGS = --ginkgo.label-filter=benchmark
+
+ifdef HELMFILE
+  BENCHMARK_FLAGS += -helmfile=$(HELMFILE)
+endif
+ifdef GUIDES
+  BENCHMARK_FLAGS += -guides=$(GUIDES)
+endif
+ifneq ($(HELMFILE_ENV),default)
+  BENCHMARK_FLAGS += -helmfile-env=$(HELMFILE_ENV)
+endif
+
+.PHONY: test-benchmark
+test-benchmark: ## Run benchmark smoke tests via helmfile
+ifndef HELMFILE
+	$(error HELMFILE is required. Usage: make test-benchmark HELMFILE=deploy/helmfiles/is-vanilla/helmfile.yaml.gotmpl GUIDES=/path/to/guides)
+endif
+	$(GO) test ./tests/ $(GO_TEST_FLAGS) -timeout 2h -args $(GINKGO_FLAGS) $(TEST_FLAGS) $(BENCHMARK_FLAGS)
+
 # ─── Model Caching ───────────────────────────────────────────────
 
 .PHONY: cache-models

@@ -33,7 +33,8 @@ var _ = BeforeSuite(func() {
 	ctx = context.Background()
 
 	// Verify manifests are available (cloned via 'make setup')
-	if testMode != "discover" {
+	// Skip when running benchmark tests (helmfile-based) or discover mode.
+	if testMode != "discover" && helmfilePath == "" {
 		manifestDir := filepath.Join(findRootDir(), "deploy", "manifests")
 		entries, _ := filepath.Glob(filepath.Join(manifestDir, "*.yaml"))
 		if len(entries) == 0 {
