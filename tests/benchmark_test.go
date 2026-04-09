@@ -154,7 +154,28 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		if !useAppWrapper {
 			Skip("not using AppWrapper")
 		}
-		err := dep.WaitForAppWrapper(ctx, appWrapperName, benchNamespace, "15m")
+		logStep("[benchmark] Waiting for AppWrapper %s to reach Running phase", appWrapperName)
+		err := retry.UntilSuccess(ctx, retry.Options{
+			Timeout:  15 * time.Minute,
+			Interval: 30 * time.Second,
+			Name:     "appwrapper-running",
+		}, func() error {
+			phase, awErr := dep.GetAppWrapperPhase(ctx, appWrapperName, benchNamespace)
+			if awErr != nil {
+				logStep("[benchmark]   AppWrapper query failed: %v", awErr)
+				return awErr
+			}
+			switch phase {
+			case "Running":
+				logStep("[benchmark]   AppWrapper is Running")
+				return nil
+			case "Failed":
+				status, _ := dep.Kubectl(ctx, "get", "appwrapper", appWrapperName, "-n", benchNamespace, "-o", "yaml")
+				Fail(fmt.Sprintf("AppWrapper %s failed.\nStatus:\n%s", appWrapperName, status))
+			}
+			logStep("[benchmark]   AppWrapper phase: %s — still waiting", phase)
+			return fmt.Errorf("AppWrapper phase is %s, not Running", phase)
+		})
 		Expect(err).NotTo(HaveOccurred(), "AppWrapper did not reach Running")
 	})
 

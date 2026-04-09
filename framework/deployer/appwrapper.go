@@ -239,6 +239,20 @@ func (d *Deployer) applyYAML(ctx context.Context, yamlContent, namespace string)
 	return nil
 }
 
+// GetAppWrapperPhase returns the current phase of an AppWrapper (e.g. "Pending", "Resuming", "Running", "Failed").
+func (d *Deployer) GetAppWrapperPhase(ctx context.Context, name, namespace string) (string, error) {
+	out, err := d.Kubectl(ctx, "get", "appwrapper", name, "-n", namespace,
+		"-o", "jsonpath={.status.phase}")
+	if err != nil {
+		return "", fmt.Errorf("getting AppWrapper phase: %w", err)
+	}
+	phase := strings.TrimSpace(out)
+	if phase == "" {
+		return "Pending", nil
+	}
+	return phase, nil
+}
+
 // WaitForAppWrapper waits for an AppWrapper to reach the Running phase.
 func (d *Deployer) WaitForAppWrapper(ctx context.Context, name, namespace, timeout string) error {
 	d.logProgress("Waiting for AppWrapper %s to be Running (timeout=%s)...", name, timeout)
