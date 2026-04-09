@@ -27,6 +27,7 @@ func (d *Deployer) HelmfileSync(ctx context.Context, helmfilePath, environment, 
 
 // HelmfileTemplate renders resources without applying them.
 // Returns the rendered multi-document YAML.
+// Uses stdout-only capture so stderr log lines don't contaminate the YAML.
 func (d *Deployer) HelmfileTemplate(ctx context.Context, helmfilePath, environment, namespace string, extraEnv map[string]string) (string, error) {
 	args := []string{
 		"--file", helmfilePath,
@@ -35,11 +36,22 @@ func (d *Deployer) HelmfileTemplate(ctx context.Context, helmfilePath, environme
 		"--quiet",
 		"template",
 	}
-	output, err := d.runHelmfile(ctx, args, extraEnv)
-	if err != nil {
-		return "", fmt.Errorf("helmfile template failed: %w\nOutput: %s", err, output)
+	cmd := exec.CommandContext(ctx, "helmfile", args...)
+	cmd.Env = os.Environ()
+	for k, v := range extraEnv {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
-	return output, nil
+	if d.Kubeconfig != "" {
+		cmd.Env = append(cmd.Env, "KUBECONFIG="+d.Kubeconfig)
+	}
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("helmfile template failed: %w\nStderr: %s", err, stderr.String())
+	}
+	return stdout.String(), nil
 }
 
 // HelmfileDestroy removes resources deployed by helmfile.
