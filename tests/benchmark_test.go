@@ -57,6 +57,7 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		vllmPods       []string
 		eppPods        []string
 		useAppWrapper  bool
+		streamer       *deployer.Streamer
 	)
 
 	BeforeAll(func() {
@@ -109,6 +110,10 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			err := dep.HelmfileSync(ctx, helmfilePath, helmfileEnv, benchNamespace, extraEnv)
 			Expect(err).NotTo(HaveOccurred(), "helmfile sync failed")
 			logStep("[benchmark] Helmfile sync completed")
+
+			// Start streaming K8s events in the background
+			streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
+			streamer.StreamEvents(ctx, "[event]")
 			return
 		}
 
@@ -147,6 +152,10 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			Namespace: benchNamespace,
 		})).To(Succeed(), "applying AppWrapper")
 		logStep("[benchmark] AppWrapper applied")
+
+		// Start streaming K8s events in the background
+		streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
+		streamer.StreamEvents(ctx, "[event]")
 	})
 
 	// ── Phase 2: WAIT FOR APPWRAPPER (if applicable) ─────────────
@@ -249,6 +258,13 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			logStep("[benchmark] WARNING: could not discover EPP pods: %v", discoverErr)
 		} else {
 			logStep("[benchmark] Found %d EPP pod(s): %v", len(eppPods), eppPods)
+		}
+
+		// Stream pod logs in the background for visibility
+		if streamer != nil {
+			for _, pod := range eppPods {
+				streamer.StreamPodLogs(ctx, pod)
+			}
 		}
 	})
 
@@ -393,6 +409,11 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 	// ── CLEANUP ──────────────────────────────────────────────────
 	AfterAll(func() {
+		// Stop background streams
+		if streamer != nil {
+			streamer.Stop()
+		}
+
 		if helmfilePath == "" {
 			return
 		}
