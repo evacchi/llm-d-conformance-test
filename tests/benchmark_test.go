@@ -156,20 +156,13 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		logStep("[benchmark] Prerequisites: %s", deployer.ResourcesSummary(classified.Prerequisites))
 		logStep("[benchmark] Workloads:      %s", deployer.ResourcesSummary(classified.Workloads))
 
-		// If no external endpoint, derive target from Gateway and add smoke-test Job
+		// Derive target from Gateway for the smoke-test Job (applied later, outside AppWrapper)
 		if endpoint == "" {
 			allResources := append(classified.Prerequisites, classified.Workloads...)
 			targetURL = deployer.DeriveTargetFromGateway(allResources, benchNamespace)
 			Expect(targetURL).NotTo(BeEmpty(), "no Gateway found in rendered resources — cannot derive in-cluster target URL")
 			logStep("[benchmark] Derived target URL: %s", targetURL)
-
-			job := deployer.BuildSmokeTestJob(deployer.SmokeTestConfig{
-				Name: smokeTestJobName, Namespace: benchNamespace,
-				Target: targetURL, Model: modelName,
-			})
-			classified.Workloads = append(classified.Workloads, job)
 			useSmokeTestJob = true
-			logStep("[benchmark] Smoke-test Job added to AppWrapper workloads")
 		}
 
 		// Ensure namespace exists
@@ -314,7 +307,15 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 	// ── Phase 4: VALIDATE SERVICE ────────────────────────────────
 	It("should validate inference service", func() {
 		if useSmokeTestJob {
-			// In-cluster smoke-test Job: wait for it to complete
+			// Deploy smoke-test Job as standalone resource (not inside AppWrapper)
+			logStep("[benchmark] Creating smoke-test Job %s (target=%s)", smokeTestJobName, targetURL)
+			job := deployer.BuildSmokeTestJob(deployer.SmokeTestConfig{
+				Name: smokeTestJobName, Namespace: benchNamespace,
+				Target: targetURL, Model: modelName,
+			})
+			Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying smoke-test Job")
+
+			// Wait for it to complete
 			logStep("[benchmark] Waiting for smoke-test Job %s to complete", smokeTestJobName)
 			err := dep.WaitForJobCompletion(ctx, smokeTestJobName, benchNamespace, 15*time.Minute)
 			Expect(err).NotTo(HaveOccurred(), "smoke test Job failed")
@@ -465,8 +466,8 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 		logStep("[benchmark] Cleaning up namespace %s", benchNamespace)
 
-		// Clean up standalone smoke-test Job (not needed for AppWrapper — Job is a component)
-		if useSmokeTestJob && !useAppWrapper {
+		// Clean up standalone smoke-test Job
+		if useSmokeTestJob {
 			_, _ = dep.Kubectl(ctx, "delete", "job", smokeTestJobName, "-n", benchNamespace, "--ignore-not-found=true")
 		}
 
