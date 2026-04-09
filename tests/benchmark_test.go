@@ -264,6 +264,16 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 					}
 				}
 
+				// Skip Job pods (smoke-test) — they are transient and won't stay Running/Ready
+				if strings.HasPrefix(podName, smokeTestJobName) {
+					continue
+				}
+
+				// Skip completed pods (phase=Succeeded)
+				if fields["phase"] == "Succeeded" {
+					continue
+				}
+
 				reason := fields["reason"]
 				if reason == "CrashLoopBackOff" || reason == "Error" || reason == "CreateContainerError" || reason == "ErrImagePull" || reason == "ImagePullBackOff" {
 					logs, _ := dep.Kubectl(ctx, "logs", podName, "-n", benchNamespace, "--tail=10", "--all-containers=true")
