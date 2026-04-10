@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -121,20 +122,13 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 				logStep("[benchmark] Auto-generated HTTPRoute: %s", route.Name)
 			}
 
-			// Deploy in-cluster smoke-test Job (if no external endpoint provided)
+			// Derive target for the benchmark Job (applied in Phase 4)
 			if endpoint == "" {
 				var gwErr error
 				targetURL, gwErr = dep.FindGatewayTarget(ctx, benchNamespace)
 				Expect(gwErr).NotTo(HaveOccurred(), "could not derive target URL from Gateway")
 				logStep("[benchmark] Derived target URL: %s", targetURL)
-
-				job := deployer.BuildSmokeTestJob(deployer.SmokeTestConfig{
-					Name: smokeTestJobName, Namespace: benchNamespace,
-					Target: targetURL, Model: modelName,
-				})
-				Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying smoke-test Job")
 				useSmokeTestJob = true
-				logStep("[benchmark] Smoke-test Job applied")
 			}
 			return
 		}
@@ -263,8 +257,8 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 					}
 				}
 
-				// Skip Job pods (smoke-test) — they are transient and won't stay Running/Ready
-				if strings.HasPrefix(podName, smokeTestJobName) {
+				// Skip benchmark Job pods — they are transient and won't stay Running/Ready
+				if strings.HasPrefix(podName, benchmarkJobName) {
 					continue
 				}
 
