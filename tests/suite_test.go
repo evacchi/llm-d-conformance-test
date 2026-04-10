@@ -38,6 +38,7 @@ var (
 	benchmarkData  string // GuideLLM data config (dataset name or JSON)
 	benchmarkRate  int    // GuideLLM requests/sec
 	benchmarkMaxS  int    // GuideLLM max duration in seconds
+	streamLogs     bool   // stream pod logs and events to stdout
 )
 
 func init() {
@@ -65,6 +66,7 @@ func init() {
 	flag.StringVar(&benchmarkData, "benchmark-data", "", "GuideLLM data config (dataset or JSON)")
 	flag.IntVar(&benchmarkRate, "benchmark-rate", 16, "GuideLLM requests/sec")
 	flag.IntVar(&benchmarkMaxS, "benchmark-max-seconds", 120, "GuideLLM max duration in seconds")
+	flag.BoolVar(&streamLogs, "stream-logs", false, "Stream pod logs and K8s events to stdout during benchmark")
 }
 
 // findRootDir walks up from the current working directory to find the project root (containing go.mod).

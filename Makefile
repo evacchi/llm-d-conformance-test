@@ -232,6 +232,9 @@ endif
 ifdef BENCHMARK_MAX_SECONDS
   BENCHMARK_FLAGS += -benchmark-max-seconds=$(BENCHMARK_MAX_SECONDS)
 endif
+ifdef STREAM_LOGS
+  BENCHMARK_FLAGS += -stream-logs
+endif
 
 .PHONY: test-benchmark
 test-benchmark: ## Run benchmark smoke tests via helmfile
