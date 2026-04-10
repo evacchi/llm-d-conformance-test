@@ -211,25 +211,45 @@ func (s *Scraper) log(format string, args ...interface{}) {
 }
 
 // ScrapePod scrapes /metrics from a specific pod using kubectl exec.
+// Tries container "main" first (conformance deployments), then without -c (auto-select, helmfile deployments).
 func (s *Scraper) ScrapePod(ctx context.Context, podName string, port int) (*ScrapeResult, error) {
-	// Try HTTPS first (vLLM uses TLS), fall back to HTTP
-	metricsURL := fmt.Sprintf("https://localhost:%d/metrics", port)
-
-	// Try python3 with SSL skip (available in vLLM containers)
-	out, pythonErr := s.Kubectl(ctx, "exec", podName, "-n", s.Namespace, "-c", "main",
-		"--", "python3", "-c",
-		fmt.Sprintf("import urllib.request,ssl; print(urllib.request.urlopen('%s',context=ssl._create_unverified_context()).read().decode())", metricsURL))
-	if pythonErr != nil {
-		// Fallback: try wget with no-check-certificate
-		var wgetErr error
-		out, wgetErr = s.Kubectl(ctx, "exec", podName, "-n", s.Namespace, "-c", "main",
-			"--", "wget", "--no-check-certificate", "-qO-", metricsURL)
-		if wgetErr != nil {
-			return nil, fmt.Errorf("scraping metrics from %s: python3 failed: %w, wget failed: %w", podName, pythonErr, wgetErr)
+	// Try container "main" first, then auto-select
+	for _, container := range []string{"main", ""} {
+		out, err := s.scrapePodContainer(ctx, podName, port, container)
+		if err == nil {
+			return newScrapeResult(podName, ParsePrometheusText(out)), nil
 		}
 	}
+	return nil, fmt.Errorf("scraping metrics from %s on port %d: all attempts failed", podName, port)
+}
 
-	return newScrapeResult(podName, ParsePrometheusText(out)), nil
+func (s *Scraper) scrapePodContainer(ctx context.Context, podName string, port int, container string) (string, error) {
+	metricsURL := fmt.Sprintf("https://localhost:%d/metrics", port)
+
+	execArgs := func(cmd ...string) []string {
+		args := []string{"exec", podName, "-n", s.Namespace}
+		if container != "" {
+			args = append(args, "-c", container)
+		}
+		args = append(args, "--")
+		args = append(args, cmd...)
+		return args
+	}
+
+	// Try python3 with SSL skip
+	out, err := s.Kubectl(ctx, execArgs("python3", "-c",
+		fmt.Sprintf("import urllib.request,ssl; print(urllib.request.urlopen('%s',context=ssl._create_unverified_context()).read().decode())", metricsURL))...)
+	if err == nil {
+		return out, nil
+	}
+
+	// Fallback: wget
+	out, err = s.Kubectl(ctx, execArgs("wget", "--no-check-certificate", "-qO-", metricsURL)...)
+	if err == nil {
+		return out, nil
+	}
+
+	return "", err
 }
 
 // listPods returns pod names matching the given label selector.
