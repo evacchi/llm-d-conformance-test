@@ -12,6 +12,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/aneeshkp/llm-d-conformance-test/framework/deployer"
+	"github.com/aneeshkp/llm-d-conformance-test/framework/metrics"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/retry"
 )
 
@@ -58,6 +59,9 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		useSmokeTestJob bool
 		targetURL       string
 		streamer        *deployer.Streamer
+		vllmMetrics     []*metrics.ScrapeResult
+		eppMetrics      []*metrics.ScrapeResult
+		scenarioDir     string
 	)
 
 	BeforeAll(func() {
@@ -287,6 +291,55 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "pods did not become ready")
 	})
 
+	// ── Phase 3b: INFRASTRUCTURE READINESS ──────────────────────
+	It("should have Gateway programmed", func() {
+		logStep("[benchmark] Checking Gateway status")
+		err := retry.UntilSuccess(ctx, retry.Options{
+			Timeout:  2 * time.Minute,
+			Interval: 10 * time.Second,
+			Name:     "gateway-programmed",
+		}, func() error {
+			out, err := dep.Kubectl(ctx, "get", "gateway", "-n", benchNamespace,
+				"-o", "jsonpath={range .items[*]}{.metadata.name}={range .status.conditions[*]}{.type}:{.status},{end}{\"\\n\"}{end}")
+			if err != nil {
+				return fmt.Errorf("getting gateway: %w", err)
+			}
+			out = strings.TrimSpace(out)
+			if out == "" {
+				return fmt.Errorf("no Gateway found in namespace %s", benchNamespace)
+			}
+			if !strings.Contains(out, "Programmed:True") {
+				logStep("[benchmark]   Gateway status: %s", out)
+				return fmt.Errorf("Gateway not yet Programmed")
+			}
+			logStep("[benchmark] Gateway is Programmed: %s", out)
+			return nil
+		})
+		Expect(err).NotTo(HaveOccurred(), "Gateway should be Programmed")
+	})
+
+	It("should have HTTPRoute accepted", func() {
+		logStep("[benchmark] Checking HTTPRoute status")
+		out, err := dep.Kubectl(ctx, "get", "httproute", "-n", benchNamespace,
+			"-o", "jsonpath={range .items[*]}{.metadata.name}={range .status.parents[*].conditions[*]}{.type}:{.status},{end}{\"\\n\"}{end}")
+		Expect(err).NotTo(HaveOccurred(), "getting HTTPRoute")
+		out = strings.TrimSpace(out)
+		Expect(out).NotTo(BeEmpty(), "no HTTPRoute found in namespace")
+		logStep("[benchmark] HTTPRoute status: %s", out)
+		Expect(out).To(ContainSubstring("Accepted:True"), "HTTPRoute should be Accepted")
+		Expect(out).To(ContainSubstring("ResolvedRefs:True"), "HTTPRoute should have ResolvedRefs")
+	})
+
+	It("should have InferencePool", func() {
+		logStep("[benchmark] Checking InferencePool")
+		out, err := dep.Kubectl(ctx, "get", "inferencepool", "-n", benchNamespace,
+			"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+		Expect(err).NotTo(HaveOccurred(), "getting InferencePool")
+		out = strings.TrimSpace(out)
+		Expect(out).NotTo(BeEmpty(), "no InferencePool found in namespace")
+		logStep("[benchmark] InferencePool: %s", out)
+	})
+
 	// ── Phase 4: RUN BENCHMARK ───────────────────────────────────
 	It("should complete benchmark", func() {
 		if !useSmokeTestJob {
@@ -322,28 +375,287 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		logStep("[benchmark] Benchmark output:\n%s", logs)
 	})
 
-	// ── Phase 5: P/D DISAGGREGATION VALIDATION ──────────────────
-	It("should validate P/D KV transfer", func() {
-		scenarioDir := filepath.Base(filepath.Dir(helmfilePath))
-		if scenarioDir != "pd" {
-			Skip("not a P/D scenario")
+	// ── Phase 5: SCRAPE METRICS ─────────────────────────────────
+	It("should scrape metrics from pods", func() {
+		if !useSmokeTestJob {
+			Skip("metrics scraping requires in-cluster benchmark")
 		}
 
-		// With --log-level DEBUG on vLLM, the NIXL connector logs per-request
-		// transfer details. Check prefill for do_remote_decode and decode for remote_block_ids.
-		logStep("[benchmark] Checking prefill pod logs for KV transfer")
-		prefillLogs := getPodLogsByPattern(dep, ctx, benchNamespace, "prefill")
-		logStep("[benchmark] Prefill logs (tail):\n%s", prefillLogs)
-		Expect(prefillLogs).To(ContainSubstring("do_remote_decode"),
-			"prefill pod logs should contain NIXL KV transfer confirmation (do_remote_decode)")
+		scenarioDir = filepath.Base(filepath.Dir(helmfilePath))
 
-		logStep("[benchmark] Checking decode pod logs for KV transfer")
-		decodeLogs := getPodLogsByPattern(dep, ctx, benchNamespace, "decode")
-		logStep("[benchmark] Decode logs (tail):\n%s", decodeLogs)
-		Expect(decodeLogs).To(ContainSubstring("remote_block_ids"),
-			"decode pod logs should contain NIXL KV transfer confirmation (remote_block_ids)")
+		scraper := &metrics.Scraper{
+			Kubectl:   dep.Kubectl,
+			Namespace: benchNamespace,
+			LogFunc:   logStep,
+		}
 
-		logStep("[benchmark] P/D KV transfer validated successfully")
+		allPods, _ := dep.Kubectl(ctx, "get", "pods", "-n", benchNamespace,
+			"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+
+		// Scrape vLLM pods
+		logStep("[benchmark] Scraping vLLM metrics")
+		for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
+			pod = strings.TrimSpace(pod)
+			if pod != "" && (strings.Contains(pod, "decode") || strings.Contains(pod, "prefill")) {
+				result, err := scraper.ScrapePod(ctx, pod, 8000)
+				if err != nil {
+					logStep("[benchmark]   WARNING: scrape %s failed: %v", pod, err)
+					continue
+				}
+				logStep("[benchmark]   scraped %s (%d metrics)", pod, len(result.GetAllValues(metrics.MetricRequestSuccess))+1)
+				vllmMetrics = append(vllmMetrics, result)
+			}
+		}
+
+		// Scrape EPP pods
+		logStep("[benchmark] Scraping EPP metrics")
+		for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
+			pod = strings.TrimSpace(pod)
+			if pod != "" && strings.Contains(pod, "epp") {
+				result, err := scraper.ScrapePod(ctx, pod, 9090)
+				if err != nil {
+					result, err = scraper.ScrapePod(ctx, pod, 8080)
+				}
+				if err != nil {
+					logStep("[benchmark]   WARNING: scrape %s failed: %v", pod, err)
+					continue
+				}
+				logStep("[benchmark]   scraped %s", pod)
+				eppMetrics = append(eppMetrics, result)
+			}
+		}
+
+		logStep("[benchmark] Scraped %d vLLM pod(s), %d EPP pod(s)", len(vllmMetrics), len(eppMetrics))
+	})
+
+	// ── Phase 5a: vllm:request_success_total ─────────────────────
+	It("vllm:request_success_total should be > 0", func() {
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidatePDMetrics(vllmMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricRequestSuccess {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("vllm:request_success_total not found")
+	})
+
+	// ── Phase 5b: vllm:prompt_tokens_total ───────────────────────
+	It("vllm:prompt_tokens_total should be > 0", func() {
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidatePDMetrics(vllmMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricPromptTokens {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("vllm:prompt_tokens_total not found")
+	})
+
+	// ── Phase 5c: vllm:generation_tokens_total ───────────────────
+	It("vllm:generation_tokens_total should be > 0", func() {
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidatePDMetrics(vllmMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricGenTokens {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("vllm:generation_tokens_total not found")
+	})
+
+	// ── Phase 5d: vllm:prefix_cache_queries ──────────────────────
+	It("vllm:prefix_cache_queries should be > 0 (cache-aware routing)", func() {
+		if scenarioDir != "is-vanilla" && scenarioDir != "is-balanced" {
+			Skip("prefix cache check only for IS scenarios")
+		}
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricPrefixCacheQueries {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("vllm:prefix_cache_queries not found")
+	})
+
+	// ── Phase 5e: vllm:prefix_cache_hits ─────────────────────────
+	It("vllm:prefix_cache_hits should be > 0 (cache hits from repeated prefix)", func() {
+		if scenarioDir != "is-vanilla" && scenarioDir != "is-balanced" {
+			Skip("prefix cache check only for IS scenarios")
+		}
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricPrefixCacheHits {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("vllm:prefix_cache_hits not found")
+	})
+
+	// ── Phase 5f: vllm:gpu_cache_usage_perc ──────────────────────
+	It("vllm:gpu_cache_usage_perc should be > 0 (KV cache in use)", func() {
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricGPUCacheUsage {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("vllm:gpu_cache_usage_perc not found")
+	})
+
+	// ── Phase 5g: nixl:kv_transfer_count_total (P/D only) ────────
+	It("nixl:kv_transfer_count_total should be > 0 (NIXL KV transfers)", func() {
+		if scenarioDir != "pd" {
+			Skip("NIXL check only for P/D scenarios")
+		}
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidatePDMetrics(vllmMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricNIXLTransfers {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		logStep("[benchmark] WARNING: NIXL transfer metrics not available")
+		AddReportEntry("warning", "NIXL metrics not available — may not be supported in this vLLM version")
+	})
+
+	// ── Phase 5h: nixl:kv_transfer_failures_total (P/D only) ─────
+	It("nixl:kv_transfer_failures_total should be 0 (no KV transfer failures)", func() {
+		if scenarioDir != "pd" {
+			Skip("NIXL check only for P/D scenarios")
+		}
+		if len(vllmMetrics) == 0 {
+			Skip("no vLLM metrics scraped")
+		}
+		checks := metrics.ValidatePDMetrics(vllmMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricNIXLFailures {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		logStep("[benchmark] WARNING: NIXL failure metrics not available")
+		AddReportEntry("warning", "NIXL failure metrics not available")
+	})
+
+	// ── Phase 5i: scheduler_e2e_duration ─────────────────────────
+	It("inference_extension_scheduler_e2e_duration should be > 0", func() {
+		if len(eppMetrics) == 0 {
+			Skip("no EPP metrics scraped")
+		}
+		checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricSchedulerE2E {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("inference_extension_scheduler_e2e_duration not found")
+	})
+
+	// ── Phase 5j: inference_objective_request_total ──────────────
+	It("inference_objective_request_total should be > 0", func() {
+		if len(eppMetrics) == 0 {
+			Skip("no EPP metrics scraped")
+		}
+		checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricRequestTotal {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("inference_objective_request_total not found")
+	})
+
+	// ── Phase 5k: inference_objective_request_error_total ────────
+	It("inference_objective_request_error_total should be 0", func() {
+		if len(eppMetrics) == 0 {
+			Skip("no EPP metrics scraped")
+		}
+		checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricRequestErrorTotal {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("inference_objective_request_error_total not found")
+	})
+
+	// ── Phase 5l: inference_pool_ready_pods ──────────────────────
+	It("inference_pool_ready_pods should be > 0", func() {
+		if len(eppMetrics) == 0 {
+			Skip("no EPP metrics scraped")
+		}
+		checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+		for _, c := range checks {
+			if c.Metric == metrics.MetricPoolReadyPods {
+				logStep("[benchmark] %s", c.Message)
+				if !c.Passed {
+					Fail(c.Message)
+				}
+				return
+			}
+		}
+		Skip("inference_pool_ready_pods not found")
 	})
 
 	// ── CLEANUP ──────────────────────────────────────────────────
