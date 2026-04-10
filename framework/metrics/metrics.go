@@ -224,8 +224,6 @@ func (s *Scraper) ScrapePod(ctx context.Context, podName string, port int) (*Scr
 }
 
 func (s *Scraper) scrapePodContainer(ctx context.Context, podName string, port int, container string) (string, error) {
-	metricsURL := fmt.Sprintf("https://localhost:%d/metrics", port)
-
 	execArgs := func(cmd ...string) []string {
 		args := []string{"exec", podName, "-n", s.Namespace}
 		if container != "" {
@@ -236,20 +234,31 @@ func (s *Scraper) scrapePodContainer(ctx context.Context, podName string, port i
 		return args
 	}
 
-	// Try python3 with SSL skip
-	out, err := s.Kubectl(ctx, execArgs("python3", "-c",
-		fmt.Sprintf("import urllib.request,ssl; print(urllib.request.urlopen('%s',context=ssl._create_unverified_context()).read().decode())", metricsURL))...)
-	if err == nil {
-		return out, nil
+	// Try HTTPS first (LLMInferenceService uses TLS), then HTTP (helmfile deployments)
+	for _, scheme := range []string{"https", "http"} {
+		metricsURL := fmt.Sprintf("%s://localhost:%d/metrics", scheme, port)
+
+		// Try python3
+		out, err := s.Kubectl(ctx, execArgs("python3", "-c",
+			fmt.Sprintf("import urllib.request,ssl; print(urllib.request.urlopen('%s',context=ssl._create_unverified_context()).read().decode())", metricsURL))...)
+		if err == nil && strings.TrimSpace(out) != "" {
+			return out, nil
+		}
+
+		// Try wget
+		out, err = s.Kubectl(ctx, execArgs("wget", "--no-check-certificate", "-qO-", metricsURL)...)
+		if err == nil && strings.TrimSpace(out) != "" {
+			return out, nil
+		}
+
+		// Try curl (available in some containers)
+		out, err = s.Kubectl(ctx, execArgs("curl", "-sf", metricsURL)...)
+		if err == nil && strings.TrimSpace(out) != "" {
+			return out, nil
+		}
 	}
 
-	// Fallback: wget
-	out, err = s.Kubectl(ctx, execArgs("wget", "--no-check-certificate", "-qO-", metricsURL)...)
-	if err == nil {
-		return out, nil
-	}
-
-	return "", err
+	return "", fmt.Errorf("all scrape attempts failed")
 }
 
 // listPods returns pod names matching the given label selector.
