@@ -284,6 +284,114 @@ func (d *Deployer) DeleteAppWrapper(ctx context.Context, name, namespace string)
 	return nil
 }
 
+// CreateHTTPRoute auto-generates an HTTPRoute if both a Gateway and an InferencePool
+// exist in the resource list but no HTTPRoute is present.
+// This mirrors burrito's behavior (suffix.rs create_http_route).
+func CreateHTTPRoute(resources []*K8sResource, namespace string) *K8sResource {
+	// Check if an HTTPRoute already exists
+	for _, r := range resources {
+		if r.Kind == "HTTPRoute" {
+			return nil
+		}
+	}
+
+	// Find Gateway and InferencePool
+	var gatewayName, poolName string
+	for _, r := range resources {
+		if r.Kind == "Gateway" && gatewayName == "" {
+			gatewayName = r.Name
+		}
+		if r.Kind == "InferencePool" && poolName == "" {
+			poolName = r.Name
+		}
+	}
+	if gatewayName == "" || poolName == "" {
+		return nil
+	}
+
+	raw := map[string]interface{}{
+		"apiVersion": "gateway.networking.k8s.io/v1",
+		"kind":       "HTTPRoute",
+		"metadata": map[string]interface{}{
+			"name":      poolName + "-route",
+			"namespace": namespace,
+		},
+		"spec": map[string]interface{}{
+			"parentRefs": []interface{}{
+				map[string]interface{}{
+					"name":      gatewayName,
+					"namespace": namespace,
+				},
+			},
+			"rules": []interface{}{
+				map[string]interface{}{
+					"backendRefs": []interface{}{
+						map[string]interface{}{
+							"group":  "inference.networking.k8s.io",
+							"kind":   "InferencePool",
+							"name":   poolName,
+							"port":   8000,
+							"weight": 1,
+						},
+					},
+					"matches": []interface{}{
+						map[string]interface{}{
+							"path": map[string]interface{}{
+								"type":  "PathPrefix",
+								"value": "/",
+							},
+						},
+					},
+					"timeouts": map[string]interface{}{
+						"backendRequest": "0s",
+						"request":        "0s",
+					},
+				},
+			},
+		},
+	}
+
+	return &K8sResource{
+		APIVersion: "gateway.networking.k8s.io/v1",
+		Kind:       "HTTPRoute",
+		Name:       poolName + "-route",
+		Namespace:  namespace,
+		Raw:        raw,
+	}
+}
+
+// CreateHTTPRouteFromCluster queries the cluster for Gateway and InferencePool resources
+// and auto-generates an HTTPRoute if both exist but no HTTPRoute is present.
+func (d *Deployer) CreateHTTPRouteFromCluster(ctx context.Context, namespace string) (*K8sResource, error) {
+	// Check if an HTTPRoute already exists
+	out, _ := d.Kubectl(ctx, "get", "httproute", "-n", namespace, "--ignore-not-found=true",
+		"-o", "jsonpath={.items[0].metadata.name}")
+	if strings.TrimSpace(out) != "" {
+		return nil, nil // already exists
+	}
+
+	// Get Gateway name
+	gwOut, err := d.Kubectl(ctx, "get", "gateway", "-n", namespace,
+		"-o", "jsonpath={.items[0].metadata.name}")
+	if err != nil || strings.TrimSpace(gwOut) == "" {
+		return nil, nil // no Gateway
+	}
+
+	// Get InferencePool name
+	poolOut, err := d.Kubectl(ctx, "get", "inferencepool", "-n", namespace,
+		"-o", "jsonpath={.items[0].metadata.name}")
+	if err != nil || strings.TrimSpace(poolOut) == "" {
+		return nil, nil // no InferencePool
+	}
+
+	// Build resources list for CreateHTTPRoute
+	resources := []*K8sResource{
+		{Kind: "Gateway", Name: strings.TrimSpace(gwOut)},
+		{Kind: "InferencePool", Name: strings.TrimSpace(poolOut)},
+	}
+	return CreateHTTPRoute(resources, namespace), nil
+}
+
 // SetResourceNamespaces overwrites the namespace on all resources.
 func SetResourceNamespaces(resources []*K8sResource, namespace string) {
 	for _, r := range resources {

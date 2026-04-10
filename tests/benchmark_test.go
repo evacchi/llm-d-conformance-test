@@ -118,6 +118,12 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 			streamer.StreamEvents(ctx, "[event]")
 			streamer.StreamAllPodLogs(ctx, 10*time.Second)
 
+			// Auto-generate and apply HTTPRoute if missing
+			if route, routeErr := dep.CreateHTTPRouteFromCluster(ctx, benchNamespace); routeErr == nil && route != nil {
+				Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{route}, benchNamespace)).To(Succeed(), "applying auto-generated HTTPRoute")
+				logStep("[benchmark] Auto-generated HTTPRoute: %s", route.Name)
+			}
+
 			// Deploy in-cluster smoke-test Job (if no external endpoint provided)
 			if endpoint == "" {
 				var gwErr error
@@ -147,6 +153,12 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 		// Ensure all resources target our namespace
 		deployer.SetResourceNamespaces(resources, benchNamespace)
+
+		// Auto-generate HTTPRoute if Gateway + InferencePool exist but no HTTPRoute
+		if route := deployer.CreateHTTPRoute(resources, benchNamespace); route != nil {
+			resources = append(resources, route)
+			logStep("[benchmark] Auto-generated HTTPRoute: %s", route.Name)
+		}
 
 		// Classify
 		classified := deployer.ClassifyResources(resources)
