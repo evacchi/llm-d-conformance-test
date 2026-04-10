@@ -10,7 +10,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/aneeshkp/llm-d-conformance-test/framework/client"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/deployer"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/retry"
 )
@@ -46,16 +45,13 @@ func helmfileExtraEnv(hfPath, model string) map[string]string {
 }
 
 const (
-	appWrapperName      = "llmd-benchmark"
-	smokeTestJobName    = "llmd-smoketest"
-	pdValidationJobName = "llmd-pd-validation"
+	appWrapperName   = "llmd-benchmark"
+	benchmarkJobName = "llmd-benchmark-job"
 )
 
 var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 	var (
 		benchNamespace  string
-		svcEndpoint     string
-		llmClient       *client.LLMClient
 		modelName       string
 		useAppWrapper   bool
 		useSmokeTestJob bool
@@ -297,138 +293,59 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "pods did not become ready")
 	})
 
-	// ── Phase 4: VALIDATE SERVICE ────────────────────────────────
-	It("should validate inference service", func() {
-		if useSmokeTestJob {
-			// Deploy smoke-test Job as standalone resource (not inside AppWrapper)
-			logStep("[benchmark] Creating smoke-test Job %s (target=%s)", smokeTestJobName, targetURL)
-			job := deployer.BuildSmokeTestJob(deployer.SmokeTestConfig{
-				Name: smokeTestJobName, Namespace: benchNamespace,
-				Target: targetURL, Model: modelName,
-			})
-			Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying smoke-test Job")
-
-			// Wait for it to complete
-			logStep("[benchmark] Waiting for smoke-test Job %s to complete", smokeTestJobName)
-			err := dep.WaitForJobCompletion(ctx, smokeTestJobName, benchNamespace, 15*time.Minute)
-			Expect(err).NotTo(HaveOccurred(), "smoke test Job failed")
-
-			logs, _ := dep.GetJobLogs(ctx, smokeTestJobName, benchNamespace)
-			logStep("[benchmark] Smoke test output:\n%s", logs)
-		} else {
-			// External endpoint validation
-			svcEndpoint = endpoint
-			logStep("[benchmark] Service endpoint: %s", svcEndpoint)
-			llmClient = client.New(svcEndpoint)
-
-			// Health check
-			logStep("[benchmark] Checking /health endpoint")
-			err := retry.UntilSuccess(ctx, retry.Options{
-				Timeout:  2 * time.Minute,
-				Interval: 5 * time.Second,
-				Name:     "health-check",
-			}, func() error {
-				return llmClient.HealthCheck(ctx)
-			})
-			Expect(err).NotTo(HaveOccurred(), "/health failed")
-
-			// Model listing
-			logStep("[benchmark] Checking /v1/models")
-			models, err := llmClient.ListModels(ctx)
-			Expect(err).NotTo(HaveOccurred(), "/v1/models failed")
-			Expect(models.Data).NotTo(BeEmpty(), "no models listed")
-			found := false
-			for _, m := range models.Data {
-				if m.ID == modelName {
-					found = true
-					break
-				}
-			}
-			if !found && len(models.Data) > 0 {
-				logStep("[benchmark] Model %s not found, using %s", modelName, models.Data[0].ID)
-				modelName = models.Data[0].ID
-			}
-			logStep("[benchmark] Model available: %s", modelName)
-
-			// Inference
-			logStep("[benchmark] Running inference test")
-			resp, err := llmClient.ChatCompletions(ctx, client.ChatRequest{
-				Model: modelName,
-				Messages: []client.ChatMessage{
-					{Role: "user", Content: "What is 2+2? Answer in one word."},
-				},
-				MaxTokens: 20,
-			})
-			Expect(err).NotTo(HaveOccurred(), "chat completion failed")
-			Expect(resp.Choices).NotTo(BeEmpty(), "no choices returned")
-			Expect(resp.Choices[0].Message.Content).NotTo(BeEmpty(), "empty response content")
-			logStep("[benchmark] Inference OK: %q (tokens=%d)", resp.Choices[0].Message.Content, resp.Usage.TotalTokens)
+	// ── Phase 4: RUN BENCHMARK ───────────────────────────────────
+	It("should complete benchmark", func() {
+		if !useSmokeTestJob {
+			Skip("using external --endpoint, skipping in-cluster benchmark")
 		}
+
+		// Build benchmark Job (GuideLLM if image configured, curl smoke test otherwise)
+		jobCfg := deployer.BenchmarkJobConfig{
+			Name: benchmarkJobName, Namespace: benchNamespace,
+			Target: targetURL, Model: modelName,
+			Image: benchmarkImage, Data: benchmarkData,
+			Rate: benchmarkRate, MaxSeconds: benchmarkMaxS,
+		}
+		if jobCfg.Image != "" {
+			logStep("[benchmark] Creating GuideLLM benchmark Job %s (image=%s, data=%s, rate=%d, max-seconds=%d)",
+				benchmarkJobName, jobCfg.Image, jobCfg.Data, jobCfg.Rate, jobCfg.MaxSeconds)
+		} else {
+			logStep("[benchmark] Creating smoke-test Job %s (target=%s)", benchmarkJobName, targetURL)
+		}
+
+		job := deployer.BuildBenchmarkJob(jobCfg)
+		Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying benchmark Job")
+
+		timeout := 15 * time.Minute
+		if jobCfg.Image != "" {
+			timeout = 60 * time.Minute // GuideLLM needs more time
+		}
+		logStep("[benchmark] Waiting for benchmark Job %s to complete", benchmarkJobName)
+		err := dep.WaitForJobCompletion(ctx, benchmarkJobName, benchNamespace, timeout)
+		Expect(err).NotTo(HaveOccurred(), "benchmark Job failed")
+
+		logs, _ := dep.GetJobLogs(ctx, benchmarkJobName, benchNamespace)
+		logStep("[benchmark] Benchmark output:\n%s", logs)
 	})
 
 	// ── Phase 5: P/D DISAGGREGATION VALIDATION ──────────────────
 	It("should validate P/D KV transfer", func() {
-		// Only run for P/D scenarios (helmfile path contains "pd")
 		scenarioDir := filepath.Base(filepath.Dir(helmfilePath))
 		if scenarioDir != "pd" {
 			Skip("not a P/D scenario")
 		}
-		if !useSmokeTestJob {
-			Skip("P/D validation requires in-cluster Job (no --endpoint)")
-		}
 
-		// Send a long prompt to trigger KV cache transfer between prefill and decode
-		logStep("[benchmark] Creating P/D validation Job (long prompt to trigger KV transfer)")
-		job := deployer.BuildPDValidationJob(deployer.SmokeTestConfig{
-			Name: pdValidationJobName, Namespace: benchNamespace,
-			Target: targetURL, Model: modelName,
-		})
-		Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying P/D validation Job")
-
-		err := dep.WaitForJobCompletion(ctx, pdValidationJobName, benchNamespace, 5*time.Minute)
-		Expect(err).NotTo(HaveOccurred(), "P/D validation Job failed")
-
-		logs, _ := dep.GetJobLogs(ctx, pdValidationJobName, benchNamespace)
-		logStep("[benchmark] P/D validation output:\n%s", logs)
-
-		// Check prefill pod logs for KV transfer confirmation
+		// With --log-level DEBUG on vLLM, the NIXL connector logs per-request
+		// transfer details. Check prefill for do_remote_decode and decode for remote_block_ids.
 		logStep("[benchmark] Checking prefill pod logs for KV transfer")
-		prefillLogs, _ := dep.Kubectl(ctx, "logs", "-n", benchNamespace,
-			"-l", "app.kubernetes.io/component=prefill",
-			"--all-containers=true", "--tail=200")
-		// Fallback: search by pod name pattern
-		if prefillLogs == "" {
-			allPods, _ := dep.Kubectl(ctx, "get", "pods", "-n", benchNamespace,
-				"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
-			for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
-				if strings.Contains(pod, "prefill") {
-					out, _ := dep.Kubectl(ctx, "logs", pod, "-n", benchNamespace,
-						"--all-containers=true", "--tail=200")
-					prefillLogs += out
-				}
-			}
-		}
-		logStep("[benchmark] Prefill logs (last 200 lines):\n%s", prefillLogs)
+		prefillLogs := getPodLogsByPattern(dep, ctx, benchNamespace, "prefill")
+		logStep("[benchmark] Prefill logs (tail):\n%s", prefillLogs)
 		Expect(prefillLogs).To(ContainSubstring("do_remote_decode"),
 			"prefill pod logs should contain NIXL KV transfer confirmation (do_remote_decode)")
 
-		// Check decode pod logs for KV transfer confirmation
 		logStep("[benchmark] Checking decode pod logs for KV transfer")
-		decodeLogs, _ := dep.Kubectl(ctx, "logs", "-n", benchNamespace,
-			"-l", "app.kubernetes.io/component=decode",
-			"--all-containers=true", "--tail=200")
-		if decodeLogs == "" {
-			allPods, _ := dep.Kubectl(ctx, "get", "pods", "-n", benchNamespace,
-				"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
-			for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
-				if strings.Contains(pod, "decode") && !strings.Contains(pod, "prefill") {
-					out, _ := dep.Kubectl(ctx, "logs", pod, "-n", benchNamespace,
-						"--all-containers=true", "--tail=200")
-					decodeLogs += out
-				}
-			}
-		}
-		logStep("[benchmark] Decode logs (last 200 lines):\n%s", decodeLogs)
+		decodeLogs := getPodLogsByPattern(dep, ctx, benchNamespace, "decode")
+		logStep("[benchmark] Decode logs (tail):\n%s", decodeLogs)
 		Expect(decodeLogs).To(ContainSubstring("remote_block_ids"),
 			"decode pod logs should contain NIXL KV transfer confirmation (remote_block_ids)")
 
@@ -452,10 +369,9 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 		logStep("[benchmark] Cleaning up namespace %s", benchNamespace)
 
-		// Clean up standalone Jobs
+		// Clean up standalone benchmark Job
 		if useSmokeTestJob {
-			_, _ = dep.Kubectl(ctx, "delete", "job", smokeTestJobName, "-n", benchNamespace, "--ignore-not-found=true")
-			_, _ = dep.Kubectl(ctx, "delete", "job", pdValidationJobName, "-n", benchNamespace, "--ignore-not-found=true")
+			_, _ = dep.Kubectl(ctx, "delete", "job", benchmarkJobName, "-n", benchNamespace, "--ignore-not-found=true")
 		}
 
 		if useAppWrapper {
@@ -473,3 +389,19 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		}
 	})
 })
+
+// getPodLogsByPattern collects logs from pods matching a name pattern in the namespace.
+func getPodLogsByPattern(dep *deployer.Deployer, ctx context.Context, namespace, pattern string) string {
+	allPods, _ := dep.Kubectl(ctx, "get", "pods", "-n", namespace,
+		"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	var logs string
+	for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
+		pod = strings.TrimSpace(pod)
+		if pod != "" && strings.Contains(pod, pattern) {
+			out, _ := dep.Kubectl(ctx, "logs", pod, "-n", namespace,
+				"--all-containers=true", "--tail=200")
+			logs += out
+		}
+	}
+	return logs
+}

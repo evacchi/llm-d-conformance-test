@@ -31,9 +31,13 @@ var (
 	mockImage      string // mock vLLM image for testing without GPU
 	pullSecretName string // override pull secret name to copy into namespace
 	// Benchmark / helmfile flags
-	helmfilePath string // path to helmfile template for benchmark scenarios
-	guidesPath   string // path to llm-d guides directory (exported as LLM_D_GUIDES)
-	helmfileEnv  string // helmfile environment (default: "default")
+	helmfilePath   string // path to helmfile template for benchmark scenarios
+	guidesPath     string // path to llm-d guides directory (exported as LLM_D_GUIDES)
+	helmfileEnv    string // helmfile environment (default: "default")
+	benchmarkImage string // GuideLLM container image (empty = curl smoke test fallback)
+	benchmarkData  string // GuideLLM data config (dataset name or JSON)
+	benchmarkRate  int    // GuideLLM requests/sec
+	benchmarkMaxS  int    // GuideLLM max duration in seconds
 )
 
 func init() {
@@ -57,6 +61,10 @@ func init() {
 	flag.StringVar(&helmfilePath, "helmfile", "", "Path to helmfile template for benchmark scenarios (e.g., deploy/helmfiles/is-vanilla/helmfile.yaml.gotmpl)")
 	flag.StringVar(&guidesPath, "guides", "", "Path to llm-d guides directory (exported as LLM_D_GUIDES for helmfile)")
 	flag.StringVar(&helmfileEnv, "helmfile-env", "default", "Helmfile environment name")
+	flag.StringVar(&benchmarkImage, "benchmark-image", "", "GuideLLM container image (empty = curl smoke test)")
+	flag.StringVar(&benchmarkData, "benchmark-data", "", "GuideLLM data config (dataset or JSON)")
+	flag.IntVar(&benchmarkRate, "benchmark-rate", 16, "GuideLLM requests/sec")
+	flag.IntVar(&benchmarkMaxS, "benchmark-max-seconds", 120, "GuideLLM max duration in seconds")
 }
 
 // findRootDir walks up from the current working directory to find the project root (containing go.mod).

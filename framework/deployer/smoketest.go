@@ -11,8 +11,7 @@ const (
 	curlImage       = "curlimages/curl:8.5.0"
 	warmupSleepSecs = 30
 
-	// smokeTestScript runs health check, model listing, and inference from inside the cluster.
-	// It expects TARGET and MODEL environment variables to be set.
+	// smokeTestScript is a fallback when no benchmark image is configured.
 	smokeTestScript = `set -e
 echo "=== Health Check ==="
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$TARGET/health")
@@ -39,17 +38,22 @@ echo "=== Smoke test passed ==="
 `
 )
 
-// SmokeTestConfig configures the in-cluster smoke-test Job.
-type SmokeTestConfig struct {
+// BenchmarkJobConfig configures the in-cluster benchmark Job.
+type BenchmarkJobConfig struct {
 	Name      string // Job name
 	Namespace string
-	Target    string // In-cluster service URL (e.g., http://gw-istio.ns.svc.cluster.local)
-	Model     string // Model name for inference test
+	Target    string // In-cluster service URL
+	Model     string // Model name
+
+	// GuideLLM settings (if Image is empty, falls back to curl smoke test)
+	Image      string // GuideLLM container image
+	Data       string // dataset name or JSON config
+	Rate       int    // requests/sec (default: 16)
+	MaxSeconds int    // benchmark duration (default: 120)
 }
 
 // DeriveTargetFromGateway scans parsed resources for a Gateway and builds the in-cluster URL.
 // Format: http://{gateway-name}-istio.{namespace}.svc.cluster.local
-// Returns empty string if no Gateway is found.
 func DeriveTargetFromGateway(resources []*K8sResource, namespace string) string {
 	for _, r := range resources {
 		if r.Kind == "Gateway" {
@@ -73,107 +77,116 @@ func (d *Deployer) FindGatewayTarget(ctx context.Context, namespace string) (str
 	return fmt.Sprintf("http://%s-istio.%s.svc.cluster.local", name, namespace), nil
 }
 
-// BuildSmokeTestJob constructs a K8s Job that validates health, model listing,
-// and inference from inside the cluster.
+// BuildBenchmarkJob constructs a Job that runs GuideLLM or a curl-based smoke test
+// inside the cluster. Mirrors burrito's benchmark Job spec.
 //
-// The Job has:
-//   - Init container: polls /v1/models until the model server is ready, then waits for warmup
-//   - Main container: runs health check, model listing, and a chat completion request
-func BuildSmokeTestJob(cfg SmokeTestConfig) *K8sResource {
+// If cfg.Image is set, runs GuideLLM with the configured parameters.
+// Otherwise, falls back to a curl-based smoke test (health + models + inference).
+func BuildBenchmarkJob(cfg BenchmarkJobConfig) *K8sResource {
 	initScript := fmt.Sprintf(
-		`until curl -sf "$TARGET/v1/models"; do echo "Waiting for model server..."; sleep 10; done; echo "Model server ready, waiting %ds for warmup..."; sleep %d`,
-		warmupSleepSecs, warmupSleepSecs,
+		`until curl -sf %s/v1/models; do echo "Waiting for model server..."; sleep 10; done; echo "Model server ready, waiting %ds for warmup..."; sleep %d`,
+		cfg.Target, warmupSleepSecs, warmupSleepSecs,
 	)
 
-	raw := map[string]interface{}{
-		"apiVersion": "batch/v1",
-		"kind":       "Job",
-		"metadata": map[string]interface{}{
-			"name":      cfg.Name,
-			"namespace": cfg.Namespace,
-		},
-		"spec": map[string]interface{}{
-			"backoffLimit":          2,
-			"activeDeadlineSeconds": 900, // 15 minutes
-			"template": map[string]interface{}{
-				"spec": map[string]interface{}{
-					"restartPolicy": "Never",
-					"initContainers": []interface{}{
-						map[string]interface{}{
-							"name":    "wait-for-ready",
-							"image":   curlImage,
-							"command": []interface{}{"sh", "-c", initScript},
-							"env": []interface{}{
-								map[string]interface{}{
-									"name":  "TARGET",
-									"value": cfg.Target,
-								},
-							},
+	initContainer := map[string]interface{}{
+		"name":    "wait-for-ready",
+		"image":   curlImage,
+		"command": []interface{}{"sh", "-c", initScript},
+	}
+
+	var mainContainer map[string]interface{}
+
+	if cfg.Image != "" {
+		// GuideLLM benchmark — matches burrito's create_benchmark_job()
+		rate := cfg.Rate
+		if rate == 0 {
+			rate = 16
+		}
+		maxSeconds := cfg.MaxSeconds
+		if maxSeconds == 0 {
+			maxSeconds = 120
+		}
+		data := cfg.Data
+		if data == "" {
+			data = "prompt_tokens=256,generated_tokens=128"
+		}
+
+		guidellmCmd := fmt.Sprintf(
+			"guidellm benchmark run --target %s --model %s --processor %s --data '%s' --rate-type concurrent --max-seconds %d --rate %d --outputs json,csv --output-dir /results",
+			cfg.Target, cfg.Model, cfg.Model, data, maxSeconds, rate,
+		)
+
+		mainContainer = map[string]interface{}{
+			"name":    "guidellm",
+			"image":   cfg.Image,
+			"command": []interface{}{"sh", "-c", guidellmCmd},
+			"env": []interface{}{
+				map[string]interface{}{
+					"name": "HF_TOKEN",
+					"valueFrom": map[string]interface{}{
+						"secretKeyRef": map[string]interface{}{
+							"name":     "llm-d-hf-token",
+							"key":      "HF_TOKEN",
+							"optional": true,
 						},
 					},
-					"containers": []interface{}{
-						map[string]interface{}{
-							"name":    "smoke-test",
-							"image":   curlImage,
-							"command": []interface{}{"sh", "-c", smokeTestScript},
-							"env": []interface{}{
-								map[string]interface{}{
-									"name":  "TARGET",
-									"value": cfg.Target,
-								},
-								map[string]interface{}{
-									"name":  "MODEL",
-									"value": cfg.Model,
-								},
-							},
-						},
-					},
+				},
+				map[string]interface{}{"name": "HOME", "value": "/tmp"},
+				map[string]interface{}{"name": "HF_HOME", "value": "/tmp/hf"},
+			},
+			"resources": map[string]interface{}{
+				"requests": map[string]interface{}{
+					"cpu":    "2",
+					"memory": "4Gi",
+				},
+				"limits": map[string]interface{}{
+					"cpu":    "4",
+					"memory": "8Gi",
 				},
 			},
-		},
+			"volumeMounts": []interface{}{
+				map[string]interface{}{
+					"name":      "results",
+					"mountPath": "/results",
+				},
+			},
+		}
+	} else {
+		// Curl-based smoke test fallback
+		mainContainer = map[string]interface{}{
+			"name":    "smoke-test",
+			"image":   curlImage,
+			"command": []interface{}{"sh", "-c", smokeTestScript},
+			"env": []interface{}{
+				map[string]interface{}{"name": "TARGET", "value": cfg.Target},
+				map[string]interface{}{"name": "MODEL", "value": cfg.Model},
+			},
+		}
 	}
 
-	return &K8sResource{
-		APIVersion: "batch/v1",
-		Kind:       "Job",
-		Name:       cfg.Name,
-		Namespace:  cfg.Namespace,
-		Raw:        raw,
+	activeDeadline := 3600 // 1 hour for GuideLLM
+	if cfg.Image == "" {
+		activeDeadline = 900 // 15 min for smoke test
 	}
-}
 
-// pdValidationScript sends a long prompt (~1k tokens) to trigger KV cache transfer
-// in P/D disaggregation setups, then reports the response.
-const pdValidationScript = `set -e
-echo "=== P/D Validation: sending long prompt to trigger KV transfer ==="
+	podSpec := map[string]interface{}{
+		"restartPolicy":  "Never",
+		"initContainers": []interface{}{initContainer},
+		"containers":     []interface{}{mainContainer},
+	}
 
-# Generate a long prompt (~1k tokens) to ensure prefill/decode disaggregation kicks in
-LONG_TEXT="Analyze the following passages and provide a detailed summary of the key themes. "
-for i in $(seq 1 50); do
-  LONG_TEXT="${LONG_TEXT}The field of distributed systems has seen remarkable advances in recent decades. Modern architectures leverage disaggregated computing resources to optimize for different workload characteristics. Prefill operations are compute-intensive while decode operations are memory-bandwidth bound. "
-done
+	// Add results volume for GuideLLM
+	if cfg.Image != "" {
+		podSpec["volumes"] = []interface{}{
+			map[string]interface{}{
+				"name": "results",
+				"emptyDir": map[string]interface{}{
+					"sizeLimit": "10Gi",
+				},
+			},
+		}
+	}
 
-BODY=$(printf '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":50}' "$MODEL" "$LONG_TEXT")
-HTTP_CODE=$(curl -s -o /tmp/pd_response.json -w "%{http_code}" "$TARGET/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
-
-if [ "$HTTP_CODE" = "200" ]; then
-  echo "Long prompt inference passed (HTTP $HTTP_CODE)"
-  cat /tmp/pd_response.json
-  echo ""
-else
-  echo "Long prompt inference failed (HTTP $HTTP_CODE)"
-  cat /tmp/pd_response.json 2>/dev/null || true
-  exit 1
-fi
-
-echo ""
-echo "=== P/D validation request completed ==="
-`
-
-// BuildPDValidationJob constructs a Job that sends a long prompt to trigger
-// P/D KV cache transfer. After this Job completes, the test runner should
-// check prefill/decode pod logs for NIXL connector transfer confirmation.
-func BuildPDValidationJob(cfg SmokeTestConfig) *K8sResource {
 	raw := map[string]interface{}{
 		"apiVersion": "batch/v1",
 		"kind":       "Job",
@@ -183,28 +196,9 @@ func BuildPDValidationJob(cfg SmokeTestConfig) *K8sResource {
 		},
 		"spec": map[string]interface{}{
 			"backoffLimit":          2,
-			"activeDeadlineSeconds": 300, // 5 minutes
+			"activeDeadlineSeconds": activeDeadline,
 			"template": map[string]interface{}{
-				"spec": map[string]interface{}{
-					"restartPolicy": "Never",
-					"containers": []interface{}{
-						map[string]interface{}{
-							"name":    "pd-validation",
-							"image":   curlImage,
-							"command": []interface{}{"sh", "-c", pdValidationScript},
-							"env": []interface{}{
-								map[string]interface{}{
-									"name":  "TARGET",
-									"value": cfg.Target,
-								},
-								map[string]interface{}{
-									"name":  "MODEL",
-									"value": cfg.Model,
-								},
-							},
-						},
-					},
-				},
+				"spec": podSpec,
 			},
 		},
 	}
@@ -238,7 +232,6 @@ func (d *Deployer) WaitForJobCompletion(ctx context.Context, jobName, namespace 
 				return fmt.Errorf("Job %s timed out after %v\nLogs:\n%s", jobName, timeout, logs)
 			}
 
-			// Get job status
 			out, err := d.Kubectl(ctx, "get", "job", jobName, "-n", namespace,
 				"-o", "jsonpath={.status.succeeded},{.status.failed},{.status.active}")
 			if err != nil {
@@ -269,13 +262,11 @@ func (d *Deployer) WaitForJobCompletion(ctx context.Context, jobName, namespace 
 				return nil
 			}
 
-			// Check for fatal pod errors (bad image, missing secret, etc.)
 			if fatalErr := d.checkJobPodErrors(ctx, jobName, namespace); fatalErr != "" {
 				logs, _ := d.GetJobLogs(ctx, jobName, namespace)
 				return fmt.Errorf("Job %s has fatal pod error: %s\nLogs:\n%s", jobName, fatalErr, logs)
 			}
 
-			// If all retries exhausted and nothing active, the job has failed
 			if failed != "" && failed != "0" && (active == "" || active == "0") {
 				logs, _ := d.GetJobLogs(ctx, jobName, namespace)
 				return fmt.Errorf("Job %s failed\nLogs:\n%s", jobName, logs)
@@ -286,7 +277,6 @@ func (d *Deployer) WaitForJobCompletion(ctx context.Context, jobName, namespace 
 	}
 }
 
-// checkJobPodErrors looks for fatal waiting reasons on a Job's pods.
 func (d *Deployer) checkJobPodErrors(ctx context.Context, jobName, namespace string) string {
 	out, _ := d.Kubectl(ctx, "get", "pods", "-n", namespace, "-l", "job-name="+jobName,
 		"-o", "jsonpath={range .items[*]}{.metadata.name} {range .status.initContainerStatuses[*]}{.state.waiting.reason} {end}{range .status.containerStatuses[*]}{.state.waiting.reason} {end}{\"\\n\"}{end}")

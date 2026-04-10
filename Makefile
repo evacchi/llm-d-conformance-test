@@ -220,6 +220,18 @@ endif
 ifneq ($(HELMFILE_ENV),default)
   BENCHMARK_FLAGS += -helmfile-env=$(HELMFILE_ENV)
 endif
+ifdef BENCHMARK_IMAGE
+  BENCHMARK_FLAGS += -benchmark-image=$(BENCHMARK_IMAGE)
+endif
+ifdef BENCHMARK_DATA
+  BENCHMARK_FLAGS += -benchmark-data=$(BENCHMARK_DATA)
+endif
+ifdef BENCHMARK_RATE
+  BENCHMARK_FLAGS += -benchmark-rate=$(BENCHMARK_RATE)
+endif
+ifdef BENCHMARK_MAX_SECONDS
+  BENCHMARK_FLAGS += -benchmark-max-seconds=$(BENCHMARK_MAX_SECONDS)
+endif
 
 .PHONY: test-benchmark
 test-benchmark: ## Run benchmark smoke tests via helmfile
