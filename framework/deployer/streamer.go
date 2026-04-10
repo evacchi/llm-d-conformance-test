@@ -54,7 +54,7 @@ func (s *Streamer) StreamPodLogs(ctx context.Context, pod string) {
 	s.streamingPods[pod] = true
 	s.mu.Unlock()
 
-	args := []string{"logs", "-f", pod, "-n", s.namespace, "--all-containers", "--prefix", "--tail=20"}
+	args := []string{"logs", "-f", pod, "-n", s.namespace, "--all-containers", "--prefix"}
 	s.startStream(ctx, "", args)
 }
 
