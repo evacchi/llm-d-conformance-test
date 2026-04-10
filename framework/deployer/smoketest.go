@@ -142,6 +142,82 @@ func BuildSmokeTestJob(cfg SmokeTestConfig) *K8sResource {
 	}
 }
 
+// pdValidationScript sends a long prompt (~1k tokens) to trigger KV cache transfer
+// in P/D disaggregation setups, then reports the response.
+const pdValidationScript = `set -e
+echo "=== P/D Validation: sending long prompt to trigger KV transfer ==="
+
+# Generate a long prompt (~1k tokens) to ensure prefill/decode disaggregation kicks in
+LONG_TEXT="Analyze the following passages and provide a detailed summary of the key themes. "
+for i in $(seq 1 50); do
+  LONG_TEXT="${LONG_TEXT}The field of distributed systems has seen remarkable advances in recent decades. Modern architectures leverage disaggregated computing resources to optimize for different workload characteristics. Prefill operations are compute-intensive while decode operations are memory-bandwidth bound. "
+done
+
+BODY=$(printf '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":50}' "$MODEL" "$LONG_TEXT")
+HTTP_CODE=$(curl -s -o /tmp/pd_response.json -w "%{http_code}" "$TARGET/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
+
+if [ "$HTTP_CODE" = "200" ]; then
+  echo "Long prompt inference passed (HTTP $HTTP_CODE)"
+  cat /tmp/pd_response.json
+  echo ""
+else
+  echo "Long prompt inference failed (HTTP $HTTP_CODE)"
+  cat /tmp/pd_response.json 2>/dev/null || true
+  exit 1
+fi
+
+echo ""
+echo "=== P/D validation request completed ==="
+`
+
+// BuildPDValidationJob constructs a Job that sends a long prompt to trigger
+// P/D KV cache transfer. After this Job completes, the test runner should
+// check prefill/decode pod logs for NIXL connector transfer confirmation.
+func BuildPDValidationJob(cfg SmokeTestConfig) *K8sResource {
+	raw := map[string]interface{}{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata": map[string]interface{}{
+			"name":      cfg.Name,
+			"namespace": cfg.Namespace,
+		},
+		"spec": map[string]interface{}{
+			"backoffLimit":          2,
+			"activeDeadlineSeconds": 300, // 5 minutes
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"restartPolicy": "Never",
+					"containers": []interface{}{
+						map[string]interface{}{
+							"name":    "pd-validation",
+							"image":   curlImage,
+							"command": []interface{}{"sh", "-c", pdValidationScript},
+							"env": []interface{}{
+								map[string]interface{}{
+									"name":  "TARGET",
+									"value": cfg.Target,
+								},
+								map[string]interface{}{
+									"name":  "MODEL",
+									"value": cfg.Model,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return &K8sResource{
+		APIVersion: "batch/v1",
+		Kind:       "Job",
+		Name:       cfg.Name,
+		Namespace:  cfg.Namespace,
+		Raw:        raw,
+	}
+}
+
 // WaitForJobCompletion polls a Job until it succeeds, fails, or times out.
 func (d *Deployer) WaitForJobCompletion(ctx context.Context, jobName, namespace string, timeout time.Duration) error {
 	d.logProgress("Waiting for Job %s to complete (timeout=%s)...", jobName, timeout)

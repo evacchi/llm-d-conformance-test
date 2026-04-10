@@ -46,8 +46,9 @@ func helmfileExtraEnv(hfPath, model string) map[string]string {
 }
 
 const (
-	appWrapperName   = "llmd-benchmark"
-	smokeTestJobName = "llmd-smoketest"
+	appWrapperName      = "llmd-benchmark"
+	smokeTestJobName    = "llmd-smoketest"
+	pdValidationJobName = "llmd-pd-validation"
 )
 
 var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
@@ -365,6 +366,75 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		}
 	})
 
+	// ── Phase 5: P/D DISAGGREGATION VALIDATION ──────────────────
+	It("should validate P/D KV transfer", func() {
+		// Only run for P/D scenarios (helmfile path contains "pd")
+		scenarioDir := filepath.Base(filepath.Dir(helmfilePath))
+		if scenarioDir != "pd" {
+			Skip("not a P/D scenario")
+		}
+		if !useSmokeTestJob {
+			Skip("P/D validation requires in-cluster Job (no --endpoint)")
+		}
+
+		// Send a long prompt to trigger KV cache transfer between prefill and decode
+		logStep("[benchmark] Creating P/D validation Job (long prompt to trigger KV transfer)")
+		job := deployer.BuildPDValidationJob(deployer.SmokeTestConfig{
+			Name: pdValidationJobName, Namespace: benchNamespace,
+			Target: targetURL, Model: modelName,
+		})
+		Expect(dep.ApplyResources(ctx, []*deployer.K8sResource{job}, benchNamespace)).To(Succeed(), "applying P/D validation Job")
+
+		err := dep.WaitForJobCompletion(ctx, pdValidationJobName, benchNamespace, 5*time.Minute)
+		Expect(err).NotTo(HaveOccurred(), "P/D validation Job failed")
+
+		logs, _ := dep.GetJobLogs(ctx, pdValidationJobName, benchNamespace)
+		logStep("[benchmark] P/D validation output:\n%s", logs)
+
+		// Check prefill pod logs for KV transfer confirmation
+		logStep("[benchmark] Checking prefill pod logs for KV transfer")
+		prefillLogs, _ := dep.Kubectl(ctx, "logs", "-n", benchNamespace,
+			"-l", "app.kubernetes.io/component=prefill",
+			"--all-containers=true", "--tail=200")
+		// Fallback: search by pod name pattern
+		if prefillLogs == "" {
+			allPods, _ := dep.Kubectl(ctx, "get", "pods", "-n", benchNamespace,
+				"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+			for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
+				if strings.Contains(pod, "prefill") {
+					out, _ := dep.Kubectl(ctx, "logs", pod, "-n", benchNamespace,
+						"--all-containers=true", "--tail=200")
+					prefillLogs += out
+				}
+			}
+		}
+		logStep("[benchmark] Prefill logs (last 200 lines):\n%s", prefillLogs)
+		Expect(prefillLogs).To(ContainSubstring("do_remote_decode"),
+			"prefill pod logs should contain NIXL KV transfer confirmation (do_remote_decode)")
+
+		// Check decode pod logs for KV transfer confirmation
+		logStep("[benchmark] Checking decode pod logs for KV transfer")
+		decodeLogs, _ := dep.Kubectl(ctx, "logs", "-n", benchNamespace,
+			"-l", "app.kubernetes.io/component=decode",
+			"--all-containers=true", "--tail=200")
+		if decodeLogs == "" {
+			allPods, _ := dep.Kubectl(ctx, "get", "pods", "-n", benchNamespace,
+				"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+			for _, pod := range strings.Split(strings.TrimSpace(allPods), "\n") {
+				if strings.Contains(pod, "decode") && !strings.Contains(pod, "prefill") {
+					out, _ := dep.Kubectl(ctx, "logs", pod, "-n", benchNamespace,
+						"--all-containers=true", "--tail=200")
+					decodeLogs += out
+				}
+			}
+		}
+		logStep("[benchmark] Decode logs (last 200 lines):\n%s", decodeLogs)
+		Expect(decodeLogs).To(ContainSubstring("remote_block_ids"),
+			"decode pod logs should contain NIXL KV transfer confirmation (remote_block_ids)")
+
+		logStep("[benchmark] P/D KV transfer validated successfully")
+	})
+
 	// ── CLEANUP ──────────────────────────────────────────────────
 	AfterAll(func() {
 		// Stop background streams
@@ -382,9 +452,10 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 
 		logStep("[benchmark] Cleaning up namespace %s", benchNamespace)
 
-		// Clean up standalone smoke-test Job
+		// Clean up standalone Jobs
 		if useSmokeTestJob {
 			_, _ = dep.Kubectl(ctx, "delete", "job", smokeTestJobName, "-n", benchNamespace, "--ignore-not-found=true")
+			_, _ = dep.Kubectl(ctx, "delete", "job", pdValidationJobName, "-n", benchNamespace, "--ignore-not-found=true")
 		}
 
 		if useAppWrapper {
