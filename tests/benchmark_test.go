@@ -191,9 +191,11 @@ var _ = Describe("Benchmark Smoke Test", Label("benchmark"), Ordered, func() {
 		logStep("[benchmark] AppWrapper applied")
 
 		// Start streaming K8s events and pod logs in the background
-		streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
-		streamer.StreamEvents(ctx, "[event]")
-		streamer.StreamAllPodLogs(ctx, 10*time.Second)
+		if streamLogs {
+			streamer = deployer.NewStreamer(kubeconfig, benchNamespace, logStep)
+			streamer.StreamEvents(ctx, "[event]")
+			streamer.StreamAllPodLogs(ctx, 10*time.Second)
+		}
 	})
 
 	// ── Phase 2: WAIT FOR APPWRAPPER (if applicable) ─────────────
